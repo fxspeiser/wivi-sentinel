@@ -1,0 +1,32 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', monospace; transition: background 0.2s ease, color 0.2s ease; }
+
+/* App title gradient — CSS class avoids React inline-style repaint flicker */
+:root { --title-green: #00ff87; }
+[data-theme="light"] { --title-green: #059669; }
+.app-title {
+  display: inline-block;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  background: linear-gradient(135deg, var(--title-green), #00b4d8);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Scrollbar — dark (default) */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: #0b1120; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+/* Scrollbar — light */
+[data-theme="light"] ::-webkit-scrollbar-track { background: #f1f5f9; }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: #cbd5e1; }
+
+@keyframes pulse      { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@keyframes fadeFlash  { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@keyframes scanLine   { 0% { transform: translateY(-100%); } 100% { transform: translateY(100vh); } }
+@keyframes approachGlow { 0%, 100% { box-shadow: 0 0 4px rgba(239,68,68,0.3); } 50% { box-shadow: 0 0 12px rgba(239,68,68,0.6); } }
+@keyframes recedeGlow   { 0%, 100% { box-shadow: 0 0 4px rgba(59,130,246,0.3); } 50% { box-shadow: 0 0 12px rgba(59,130,246,0.6); } }

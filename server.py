@@ -4,7 +4,7 @@ Wi-Vi Sentinel v2 - Local Security API Server
 REST API for WiFi-based biometric detection, classification, and tracking.
 """
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
 import numpy as np
 import time
@@ -13,6 +13,9 @@ import threading
 import queue
 import os
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,12 +33,21 @@ app = Flask(__name__, static_folder=None)
 CORS(app)
 
 DATA_DIR = os.path.join(BASE_DIR, 'data')
+DIST_DIR = os.path.join(BASE_DIR, 'dist')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 @app.route('/')
 def index():
-    return open(os.path.join(BASE_DIR, 'index.html')).read()
+    # Serve Vite build if available, otherwise fall back to CDN Babel version
+    if os.path.exists(os.path.join(DIST_DIR, 'index.html')):
+        return send_from_directory(DIST_DIR, 'index.html')
+    return open(os.path.join(BASE_DIR, 'index.legacy.html')).read()
+
+
+@app.route('/assets/<path:filename>')
+def assets(filename):
+    return send_from_directory(os.path.join(DIST_DIR, 'assets'), filename)
 
 
 # ─── CSI Source Selection ────────────────────────────────────────────────────
@@ -432,6 +444,7 @@ detector_thread = threading.Thread(target=detection_loop, daemon=True)
 detector_thread.start()
 
 if __name__ == '__main__':
-    print(f"Wi-Vi Sentinel v2 API starting on :5555")
+    flask_port = int(os.environ.get('FLASK_PORT', 5555))
+    print(f"Wi-Vi Sentinel v2 API starting on :{flask_port}")
     print(f"Data directory: {DATA_DIR}")
-    app.run(host='0.0.0.0', port=5555, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=flask_port, debug=False, threaded=True)

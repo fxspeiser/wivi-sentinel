@@ -16,6 +16,7 @@ data/*.json
 # Environment / secrets
 .env
 *.env
+!.env.example
 config.local.json
 
 # macOS
@@ -35,3 +36,4 @@ logs/
 
 # Node (for dashboard dev)
 node_modules/
+dist/
