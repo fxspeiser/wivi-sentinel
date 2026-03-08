@@ -17,7 +17,7 @@ Passive through-wall sensing using a Raspberry Pi 4 + Nexmon CSI firmware.
        │
        │ UDP :5500 (CSI frames) over Ethernet
        │
-  [Your Mac]
+  [Your Mac / Linux machine]
        │  server.py — signal processing, classification
        │  Species / sex / direction / device correlation
        │
@@ -37,12 +37,46 @@ Passive through-wall sensing using a Raspberry Pi 4 + Nexmon CSI firmware.
 
 ---
 
-## Mac Setup
+## Host Machine Setup (Mac / Linux)
+
+The host machine runs `server.py` — it receives CSI frames from the Pi, classifies them, and serves the dashboard. Any machine on the same LAN works.
+
+### Prerequisites
+
+**macOS**
+
+Python 3 and Node.js are the only requirements. Both are available via [Homebrew](https://brew.sh):
+
+```bash
+brew install python node
+```
+
+**Linux (Debian / Ubuntu)**
+
+```bash
+sudo apt update
+sudo apt install python3 python3-pip python3-venv nodejs npm
+
+# mDNS device scanning requires avahi-daemon:
+sudo apt install avahi-daemon
+sudo systemctl enable --now avahi-daemon
+```
+
+> **Probe request sniffing on Linux** — `scapy` needs raw socket access. Either run `server.py` with `sudo`, or grant the capability without root:
+> ```bash
+> sudo setcap cap_net_raw+ep $(which python3)
+> ```
+> mDNS scanning works without elevated privileges.
+
+---
 
 ### Python backend
 
 ```bash
 pip3 install -r requirements.txt
+# or inside a virtualenv:
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### Dashboard (two options)
@@ -51,7 +85,8 @@ pip3 install -r requirements.txt
 
 ```bash
 python3 server.py
-# open http://localhost:5555
+# Mac:   open http://localhost:5555
+# Linux: xdg-open http://localhost:5555
 ```
 
 **Option B — Vite build (faster, production-ready):**
@@ -60,7 +95,6 @@ python3 server.py
 npm install
 npm run build          # outputs to dist/
 python3 server.py      # automatically serves dist/ when present
-# open http://localhost:5555
 ```
 
 **Option B dev mode (hot reload):**
@@ -69,7 +103,6 @@ python3 server.py      # automatically serves dist/ when present
 npm install
 python3 server.py &    # Flask API on :5555
 npm run dev            # Vite dev server on :3000, proxies /api to Flask
-# open http://localhost:3000
 ```
 
 ### Simulated mode (no Pi required)
