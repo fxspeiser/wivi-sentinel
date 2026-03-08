@@ -1,0 +1,955 @@
+"""
+CSI Signal Processing Engine v2
+=================================
+Processes WiFi Channel State Information (CSI) to extract:
+  - Heartbeat signatures (0.8-2.5 Hz cardiac band)
+  - Gait signatures (Doppler shift + movement pattern classification)
+  - Species classification (human vs animal via cardiac/respiratory/gait analysis)
+  - Sex estimation (male/female via gait cadence, stride, body attenuation)
+  - Direction of travel (approaching/receding via Doppler phase shift)
+
+Research references:
+  - Wi-Vi: Adib & Katabi, SIGCOMM 2013 (through-wall tracking)
+  - WiGait: Hsu et al., MobiCom 2017 (gait velocity from WiFi)
+  - BodyScan: Zheng et al., ACM MobiSys 2020 (body composition via WiFi CSI)
+  - WiStep: Wang et al., IEEE TMC 2021 (gait-based sex classification)
+  - PhaseBeat: Wang et al., ACM MobiCom 2017 (cardiac monitoring via phase)
+
+Architecture supports pluggable CSI sources:
+  - SimulatedCSISource (demo mode with realistic synthetic data)
+  - LinuxCSIToolSource (Linux 802.11n CSI Tool - Atheros)
+  - NexmonCSISource (Nexmon firmware - Broadcom)
+"""
+
+import numpy as np
+from scipy import signal as sig
+from scipy.spatial.distance import euclidean
+from scipy.interpolate import interp1d
+import time
+import hashlib
+import json
+import os
+import threading
+import logging
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+
+CSI_SAMPLE_RATE = 100        # Hz - CSI packet rate
+HEARTBEAT_BAND = (0.8, 2.5)  # Hz - covers 48-150 BPM
+RESPIRATION_BAND = (0.1, 0.5) # Hz - respiratory
+GAIT_CYCLE_BAND = (0.5, 4.0)  # Hz - walking cadence
+WINDOW_SIZE = 512             # samples per analysis window
+HOP_SIZE = 64                 # overlap hop
+N_SUBCARRIERS = 56            # 802.11n 20MHz
+SIGNATURE_LENGTH = 128        # compressed signature vector length
+MATCH_THRESHOLD = 0.72        # cosine similarity threshold for positive ID
+HIGH_CONFIDENCE = 0.85
+DTW_MAX_WARP = 15             # DTW warping constraint
+
+# Carrier frequency for Doppler calculation (WiFi 5GHz channel 36)
+CARRIER_FREQ_HZ = 5.18e9
+SPEED_OF_LIGHT = 3e8
+WAVELENGTH = SPEED_OF_LIGHT / CARRIER_FREQ_HZ  # ~0.058m
+
+# ─── Species Classification Thresholds ───────────────────────────────────────
+# Based on comparative physiology:
+#   Human resting HR:   60-100 BPM  | Resp: 12-20 bpm  | Bipedal gait 85-140 spm
+#   Dog HR:             60-140 BPM  | Resp: 15-30 bpm  | Quadruped gait 150-250 spm
+#   Cat HR:            120-240 BPM  | Resp: 20-30 bpm  | Quadruped gait 170-280 spm
+#   Large animals:      28-80 BPM   | Resp:  8-15 bpm  | Gait varies
+
+SPECIES_PROFILES = {
+    'human': {
+        'hr_range': (48, 110),
+        'resp_range': (10, 24),
+        'cadence_range': (70, 150),
+        'bipedal': True,
+        'gait_harmonic_ratio': (0.3, 0.7),  # 2nd/1st harmonic - bipedal symmetry
+    },
+    'dog': {
+        'hr_range': (55, 160),
+        'resp_range': (14, 35),
+        'cadence_range': (140, 280),
+        'bipedal': False,
+        'gait_harmonic_ratio': (0.1, 0.35),  # quadruped has lower 2nd harmonic
+    },
+    'cat': {
+        'hr_range': (110, 260),
+        'resp_range': (18, 35),
+        'cadence_range': (160, 300),
+        'bipedal': False,
+        'gait_harmonic_ratio': (0.05, 0.3),
+    },
+    'large_animal': {
+        'hr_range': (25, 85),
+        'resp_range': (6, 18),
+        'cadence_range': (40, 120),
+        'bipedal': False,
+        'gait_harmonic_ratio': (0.15, 0.5),
+    },
+}
+
+# ─── Sex Estimation Thresholds ───────────────────────────────────────────────
+# Based on WiStep (Wang et al. IEEE TMC 2021) and biomechanics literature:
+#   Males:   cadence 100-120 spm, stride 0.70-0.85m, higher body attenuation
+#   Females: cadence 110-130 spm, stride 0.55-0.72m, lower body attenuation
+# Plus cardiac differences: female resting HR tends 2-8 BPM higher
+
+SEX_FEATURES = {
+    'male': {
+        'cadence_center': 108,
+        'stride_regularity_center': 0.65,
+        'body_attenuation_center': 0.65,  # higher mass = more signal impact
+        'hr_offset': 0,
+    },
+    'female': {
+        'cadence_center': 118,
+        'stride_regularity_center': 0.60,
+        'body_attenuation_center': 0.45,
+        'hr_offset': 4,  # avg BPM higher
+    },
+}
+
+
+class CSIFrame:
+    """Single CSI measurement frame across all subcarriers."""
+    def __init__(self, timestamp: float, amplitudes: np.ndarray, phases: np.ndarray):
+        self.timestamp = timestamp
+        self.amplitudes = amplitudes  # shape: (N_SUBCARRIERS,)
+        self.phases = phases          # shape: (N_SUBCARRIERS,)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CLASSIFIERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SpeciesClassifier:
+    """
+    Classifies detected entity as human or animal species using multi-band
+    biometric analysis. Uses cardiac rate, respiratory rate, gait cadence,
+    and gait harmonic structure.
+    
+    Approach:
+      1. Score each species profile against observed biometrics
+      2. Weight by feature reliability (cardiac > gait > respiratory)
+      3. Return top classification with confidence
+    """
+
+    @staticmethod
+    def classify(bpm: float, resp_rate: float, cadence: float,
+                 harmonic_ratio: float = 0.5, body_attenuation: float = 0.5) -> dict:
+        """
+        Returns: {species: str, confidence: float, scores: dict}
+        """
+        scores = {}
+
+        for species, prof in SPECIES_PROFILES.items():
+            score = 0.0
+            weights_sum = 0.0
+
+            # Cardiac rate match (weight: 3.0)
+            if bpm > 0:
+                hr_mid = (prof['hr_range'][0] + prof['hr_range'][1]) / 2.0
+                hr_span = (prof['hr_range'][1] - prof['hr_range'][0]) / 2.0
+                hr_dist = abs(bpm - hr_mid) / (hr_span + 1e-10)
+                hr_score = max(0, 1.0 - hr_dist * 0.5)
+                # Bonus if within range
+                if prof['hr_range'][0] <= bpm <= prof['hr_range'][1]:
+                    hr_score = max(hr_score, 0.7)
+                score += hr_score * 3.0
+                weights_sum += 3.0
+
+            # Respiratory rate match (weight: 1.5)
+            if resp_rate > 0:
+                resp_mid = (prof['resp_range'][0] + prof['resp_range'][1]) / 2.0
+                resp_span = (prof['resp_range'][1] - prof['resp_range'][0]) / 2.0
+                resp_dist = abs(resp_rate - resp_mid) / (resp_span + 1e-10)
+                resp_score = max(0, 1.0 - resp_dist * 0.5)
+                if prof['resp_range'][0] <= resp_rate <= prof['resp_range'][1]:
+                    resp_score = max(resp_score, 0.6)
+                score += resp_score * 1.5
+                weights_sum += 1.5
+
+            # Gait cadence match (weight: 2.5)
+            if cadence > 0:
+                cad_mid = (prof['cadence_range'][0] + prof['cadence_range'][1]) / 2.0
+                cad_span = (prof['cadence_range'][1] - prof['cadence_range'][0]) / 2.0
+                cad_dist = abs(cadence - cad_mid) / (cad_span + 1e-10)
+                cad_score = max(0, 1.0 - cad_dist * 0.5)
+                if prof['cadence_range'][0] <= cadence <= prof['cadence_range'][1]:
+                    cad_score = max(cad_score, 0.65)
+                score += cad_score * 2.5
+                weights_sum += 2.5
+
+            # Harmonic ratio (bipedal vs quadruped) (weight: 2.0)
+            if harmonic_ratio > 0:
+                hr_lo, hr_hi = prof['gait_harmonic_ratio']
+                if hr_lo <= harmonic_ratio <= hr_hi:
+                    harm_score = 0.8
+                else:
+                    harm_dist = min(abs(harmonic_ratio - hr_lo), abs(harmonic_ratio - hr_hi))
+                    harm_score = max(0, 0.8 - harm_dist * 2.0)
+                score += harm_score * 2.0
+                weights_sum += 2.0
+
+            scores[species] = score / (weights_sum + 1e-10)
+
+        # Determine winner
+        best_species = max(scores, key=scores.get)
+        best_score = scores[best_species]
+
+        # Confidence based on margin over second best
+        sorted_scores = sorted(scores.values(), reverse=True)
+        margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) > 1 else sorted_scores[0]
+        confidence = min(1.0, best_score * (0.5 + margin))
+
+        return {
+            'species': best_species,
+            'confidence': round(float(confidence), 3),
+            'scores': {k: round(v, 3) for k, v in scores.items()},
+        }
+
+
+class SexEstimator:
+    """
+    Estimates biological sex from WiFi CSI biometric features.
+    Based on WiStep methodology: gait cadence, stride characteristics,
+    body attenuation profile, and resting heart rate differences.
+    
+    Returns probabilistic estimate, not binary classification.
+    """
+
+    @staticmethod
+    def estimate(cadence: float, stride_regularity: float,
+                 body_attenuation: float, bpm: float = 0.0) -> dict:
+        """
+        Returns: {estimation: str, male_prob: float, female_prob: float, confidence: float}
+        """
+        male_score = 0.0
+        female_score = 0.0
+        feature_count = 0
+
+        # Cadence analysis (females tend higher cadence at same speed)
+        if cadence > 0:
+            m_cad_dist = abs(cadence - SEX_FEATURES['male']['cadence_center'])
+            f_cad_dist = abs(cadence - SEX_FEATURES['female']['cadence_center'])
+            # Gaussian-like scoring
+            male_score += np.exp(-0.5 * (m_cad_dist / 12.0) ** 2)
+            female_score += np.exp(-0.5 * (f_cad_dist / 12.0) ** 2)
+            feature_count += 1
+
+        # Stride regularity (males tend higher due to longer legs / more consistent gait)
+        if stride_regularity > 0:
+            m_sr_dist = abs(stride_regularity - SEX_FEATURES['male']['stride_regularity_center'])
+            f_sr_dist = abs(stride_regularity - SEX_FEATURES['female']['stride_regularity_center'])
+            male_score += np.exp(-0.5 * (m_sr_dist / 0.12) ** 2)
+            female_score += np.exp(-0.5 * (f_sr_dist / 0.12) ** 2)
+            feature_count += 1
+
+        # Body attenuation (proxy for body mass - males generally higher)
+        if body_attenuation > 0:
+            m_ba_dist = abs(body_attenuation - SEX_FEATURES['male']['body_attenuation_center'])
+            f_ba_dist = abs(body_attenuation - SEX_FEATURES['female']['body_attenuation_center'])
+            male_score += np.exp(-0.5 * (m_ba_dist / 0.15) ** 2) * 0.8  # lower weight - less reliable
+            female_score += np.exp(-0.5 * (f_ba_dist / 0.15) ** 2) * 0.8
+            feature_count += 1
+
+        # Heart rate offset (females avg ~4 BPM higher at rest)
+        if bpm > 40:
+            # Center around population average ~72 BPM
+            male_hr_expected = 70
+            female_hr_expected = 74
+            m_hr_dist = abs(bpm - male_hr_expected)
+            f_hr_dist = abs(bpm - female_hr_expected)
+            male_score += np.exp(-0.5 * (m_hr_dist / 15.0) ** 2) * 0.6
+            female_score += np.exp(-0.5 * (f_hr_dist / 15.0) ** 2) * 0.6
+            feature_count += 1
+
+        if feature_count == 0:
+            return {
+                'estimation': 'unknown',
+                'male_prob': 0.5,
+                'female_prob': 0.5,
+                'confidence': 0.0,
+            }
+
+        # Normalize to probabilities
+        total = male_score + female_score + 1e-10
+        male_prob = male_score / total
+        female_prob = female_score / total
+
+        # Confidence based on separation and feature count
+        separation = abs(male_prob - female_prob)
+        feature_factor = min(1.0, feature_count / 3.0)
+        confidence = separation * feature_factor
+
+        estimation = 'male' if male_prob > female_prob else 'female'
+        if confidence < 0.15:
+            estimation = 'indeterminate'
+
+        return {
+            'estimation': estimation,
+            'male_prob': round(float(male_prob), 3),
+            'female_prob': round(float(female_prob), 3),
+            'confidence': round(float(confidence), 3),
+        }
+
+
+class DopplerDirectionDetector:
+    """
+    Detects direction of travel (approaching/receding) using WiFi CSI phase
+    information and Doppler frequency shift analysis.
+    
+    Based on Fresnel zone model (Wang et al., MobiCom 2016):
+      - Approaching target: positive Doppler shift (phase decreasing)
+      - Receding target: negative Doppler shift (phase increasing)
+      - Stationary: no consistent phase drift
+    
+    Uses unwrapped phase across subcarriers to estimate radial velocity.
+    """
+
+    @staticmethod
+    def detect_direction(phase_matrix: np.ndarray, amplitude_matrix: np.ndarray) -> dict:
+        """
+        Analyze phase evolution to determine movement direction.
+        
+        Args:
+            phase_matrix: shape (n_samples, N_SUBCARRIERS) - raw phase per frame
+            amplitude_matrix: shape (n_samples, N_SUBCARRIERS)
+            
+        Returns:
+            dict with direction, radial_velocity, confidence
+        """
+        n_samples = phase_matrix.shape[0]
+        if n_samples < 10:
+            return {'direction': 'unknown', 'radial_velocity': 0.0, 'confidence': 0.0}
+
+        # Unwrap phase per subcarrier to remove 2π discontinuities
+        unwrapped = np.unwrap(phase_matrix, axis=0)
+
+        # Remove linear phase offset across subcarriers (timing offset)
+        # Use amplitude-weighted average phase rate
+        amp_weights = np.mean(amplitude_matrix, axis=0)
+        amp_weights = amp_weights / (np.sum(amp_weights) + 1e-10)
+
+        # Compute phase rate of change per subcarrier
+        phase_rate = np.diff(unwrapped, axis=0) * CSI_SAMPLE_RATE  # rad/s
+
+        # Weighted average phase rate across subcarriers
+        weighted_rate = np.sum(phase_rate * amp_weights[np.newaxis, :], axis=1)
+
+        # Smooth with moving average
+        kernel_size = min(20, len(weighted_rate) // 3)
+        if kernel_size > 1:
+            kernel = np.ones(kernel_size) / kernel_size
+            smoothed_rate = np.convolve(weighted_rate, kernel, mode='valid')
+        else:
+            smoothed_rate = weighted_rate
+
+        # Average Doppler frequency shift
+        mean_doppler = np.mean(smoothed_rate)  # rad/s
+        doppler_hz = mean_doppler / (2 * np.pi)  # Hz
+
+        # Convert to radial velocity: v = λ * f_doppler / 2
+        radial_velocity = WAVELENGTH * doppler_hz / 2.0  # m/s
+
+        # Determine direction
+        # Positive radial velocity = approaching (path length decreasing)
+        # Negative = receding
+        velocity_threshold = 0.05  # m/s minimum to declare direction
+
+        if abs(radial_velocity) < velocity_threshold:
+            direction = 'stationary'
+        elif radial_velocity > 0:
+            direction = 'approaching'
+        else:
+            direction = 'receding'
+
+        # Confidence based on consistency of phase rate sign
+        if len(smoothed_rate) > 0:
+            sign_consistency = abs(np.mean(np.sign(smoothed_rate)))
+            amplitude_change = np.mean(amplitude_matrix[-n_samples//4:]) - np.mean(amplitude_matrix[:n_samples//4])
+            # Cross-validate: approaching should also show amplitude increase
+            if direction == 'approaching' and amplitude_change > 0:
+                amp_agreement = 1.0
+            elif direction == 'receding' and amplitude_change < 0:
+                amp_agreement = 1.0
+            elif direction == 'stationary':
+                amp_agreement = 1.0
+            else:
+                amp_agreement = 0.5  # phase and amplitude disagree
+
+            confidence = sign_consistency * 0.6 + amp_agreement * 0.4
+        else:
+            confidence = 0.0
+
+        # Speed estimate
+        speed_mps = abs(radial_velocity)
+
+        return {
+            'direction': direction,
+            'radial_velocity': round(float(radial_velocity), 4),
+            'speed_mps': round(float(speed_mps), 3),
+            'speed_kmh': round(float(speed_mps * 3.6), 2),
+            'confidence': round(float(min(1.0, confidence)), 3),
+            'doppler_hz': round(float(doppler_hz), 3),
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIGNATURE EXTRACTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SignatureExtractor:
+    """Extracts biometric signatures from CSI stream buffers."""
+
+    def __init__(self):
+        self._design_filters()
+
+    def _design_filters(self):
+        nyq = CSI_SAMPLE_RATE / 2.0
+        self.hb_b, self.hb_a = sig.butter(4, [HEARTBEAT_BAND[0]/nyq, HEARTBEAT_BAND[1]/nyq], btype='band')
+        self.resp_b, self.resp_a = sig.butter(3, [RESPIRATION_BAND[0]/nyq, RESPIRATION_BAND[1]/nyq], btype='band')
+        self.gait_b, self.gait_a = sig.butter(4, [GAIT_CYCLE_BAND[0]/nyq, GAIT_CYCLE_BAND[1]/nyq], btype='band')
+
+    def extract_heartbeat_signature(self, amplitude_matrix: np.ndarray) -> dict:
+        centered = amplitude_matrix - np.mean(amplitude_matrix, axis=0)
+        try:
+            U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+            pc1 = U[:, 0] * S[0]
+        except np.linalg.LinAlgError:
+            pc1 = np.mean(centered, axis=1)
+
+        cardiac = sig.filtfilt(self.hb_b, self.hb_a, pc1)
+        respiratory = sig.filtfilt(self.resp_b, self.resp_a, pc1)
+
+        freqs, psd = sig.welch(cardiac, fs=CSI_SAMPLE_RATE, nperseg=min(256, len(cardiac)))
+        hb_mask = (freqs >= HEARTBEAT_BAND[0]) & (freqs <= HEARTBEAT_BAND[1])
+        if np.any(hb_mask):
+            peak_freq = freqs[hb_mask][np.argmax(psd[hb_mask])]
+            bpm = peak_freq * 60.0
+            snr = np.max(psd[hb_mask]) / (np.mean(psd) + 1e-10)
+        else:
+            bpm = 0.0
+            snr = 0.0
+
+        hb_psd = psd[hb_mask] if np.any(hb_mask) else np.zeros(10)
+        hb_psd = hb_psd / (np.max(hb_psd) + 1e-10)
+
+        autocorr = np.correlate(cardiac, cardiac, mode='full')
+        autocorr = autocorr[len(autocorr)//2:]
+        autocorr = autocorr[:SIGNATURE_LENGTH//2] / (autocorr[0] + 1e-10)
+
+        sig_vector = np.zeros(SIGNATURE_LENGTH)
+        if len(hb_psd) > 1:
+            f_interp = interp1d(np.linspace(0, 1, len(hb_psd)), hb_psd, kind='linear')
+            sig_vector[:SIGNATURE_LENGTH//2] = f_interp(np.linspace(0, 1, SIGNATURE_LENGTH//2))
+        ac_len = min(len(autocorr), SIGNATURE_LENGTH//2)
+        sig_vector[SIGNATURE_LENGTH//2:SIGNATURE_LENGTH//2+ac_len] = autocorr[:ac_len]
+
+        norm = np.linalg.norm(sig_vector)
+        if norm > 0:
+            sig_vector = sig_vector / norm
+
+        quality = min(1.0, snr / 20.0)
+        resp_rate = self._estimate_resp_rate(respiratory)
+
+        return {
+            'signature': sig_vector.tolist(),
+            'bpm': round(float(bpm), 1),
+            'signal_quality': round(float(quality), 3),
+            'respiratory_rate': round(float(resp_rate), 1),
+        }
+
+    def _estimate_resp_rate(self, respiratory_signal: np.ndarray) -> float:
+        freqs, psd = sig.welch(respiratory_signal, fs=CSI_SAMPLE_RATE, nperseg=min(256, len(respiratory_signal)))
+        resp_mask = (freqs >= RESPIRATION_BAND[0]) & (freqs <= RESPIRATION_BAND[1])
+        if np.any(resp_mask) and np.max(psd[resp_mask]) > 0:
+            return freqs[resp_mask][np.argmax(psd[resp_mask])] * 60.0
+        return 0.0
+
+    def extract_gait_signature(self, amplitude_matrix: np.ndarray) -> dict:
+        centered = amplitude_matrix - np.mean(amplitude_matrix, axis=0)
+        velocity = np.diff(centered, axis=0)
+
+        try:
+            U, S, Vt = np.linalg.svd(velocity, full_matrices=False)
+            n_components = min(3, U.shape[1])
+            components = U[:, :n_components] * S[:n_components]
+        except np.linalg.LinAlgError:
+            components = np.mean(velocity, axis=1, keepdims=True)
+            n_components = 1
+
+        gait_signal = sig.filtfilt(self.gait_b, self.gait_a, components[:, 0])
+
+        freqs, psd = sig.welch(gait_signal, fs=CSI_SAMPLE_RATE, nperseg=min(256, len(gait_signal)))
+        gait_mask = (freqs >= GAIT_CYCLE_BAND[0]) & (freqs <= GAIT_CYCLE_BAND[1])
+
+        if np.any(gait_mask) and np.max(psd[gait_mask]) > 0:
+            peak_freq = freqs[gait_mask][np.argmax(psd[gait_mask])]
+            cadence = peak_freq * 60.0
+            snr = np.max(psd[gait_mask]) / (np.mean(psd) + 1e-10)
+        else:
+            cadence = 0.0
+            snr = 0.0
+
+        # Compute harmonic ratio (2nd harmonic / 1st harmonic power)
+        harmonic_ratio = 0.5
+        if cadence > 0:
+            fund_freq = cadence / 60.0
+            second_harm = fund_freq * 2
+            fund_mask = (freqs >= fund_freq * 0.8) & (freqs <= fund_freq * 1.2)
+            harm_mask = (freqs >= second_harm * 0.8) & (freqs <= second_harm * 1.2)
+            fund_power = np.sum(psd[fund_mask]) if np.any(fund_mask) else 1e-10
+            harm_power = np.sum(psd[harm_mask]) if np.any(harm_mask) else 0
+            harmonic_ratio = float(harm_power / (fund_power + 1e-10))
+
+        sig_vector = np.zeros(SIGNATURE_LENGTH)
+        chunk = SIGNATURE_LENGTH // 4
+
+        gait_psd = psd[gait_mask] if np.any(gait_mask) else np.zeros(10)
+        gait_psd_norm = gait_psd / (np.max(gait_psd) + 1e-10)
+        if len(gait_psd_norm) > 1:
+            f = interp1d(np.linspace(0, 1, len(gait_psd_norm)), gait_psd_norm, kind='linear')
+            sig_vector[:chunk] = f(np.linspace(0, 1, chunk))
+
+        ac = np.correlate(gait_signal, gait_signal, mode='full')
+        ac = ac[len(ac)//2:]
+        ac = ac[:chunk] / (ac[0] + 1e-10)
+        sig_vector[chunk:2*chunk] = ac[:chunk]
+
+        if n_components >= 2:
+            cross_corr = np.correlate(components[:, 0], components[:, 1], mode='full')
+            cross_corr = cross_corr[len(cross_corr)//2:]
+            cc_norm = cross_corr[:chunk] / (np.max(np.abs(cross_corr)) + 1e-10)
+            sig_vector[2*chunk:3*chunk] = cc_norm
+
+        var_profile = np.var(velocity, axis=0)
+        var_profile = var_profile / (np.max(var_profile) + 1e-10)
+        if len(var_profile) > 1:
+            f2 = interp1d(np.linspace(0, 1, len(var_profile)), var_profile, kind='linear')
+            sig_vector[3*chunk:] = f2(np.linspace(0, 1, SIGNATURE_LENGTH - 3*chunk))
+
+        norm = np.linalg.norm(sig_vector)
+        if norm > 0:
+            sig_vector = sig_vector / norm
+
+        stride_regularity = 0.0
+        if len(ac) > 20:
+            peaks, _ = sig.find_peaks(ac, distance=10, height=0.1)
+            if len(peaks) > 0:
+                stride_regularity = float(ac[peaks[0]])
+
+        quality = min(1.0, snr / 15.0)
+
+        # Body attenuation estimate from signal variance
+        body_attenuation = float(np.mean(np.var(amplitude_matrix, axis=0)))
+
+        return {
+            'signature': sig_vector.tolist(),
+            'cadence_spm': round(float(cadence), 1),
+            'stride_regularity': round(float(stride_regularity), 3),
+            'signal_quality': round(float(quality), 3),
+            'harmonic_ratio': round(float(harmonic_ratio), 4),
+            'body_attenuation': round(float(body_attenuation), 4),
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIGNATURE MATCHING
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SignatureMatcher:
+    @staticmethod
+    def cosine_similarity(a, b):
+        dot = np.dot(a, b)
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        return float(dot / (na * nb)) if na > 0 and nb > 0 else 0.0
+
+    @staticmethod
+    def dtw_distance(a, b, max_warp=DTW_MAX_WARP):
+        n, m = len(a), len(b)
+        dtw_matrix = np.full((n+1, m+1), np.inf)
+        dtw_matrix[0, 0] = 0.0
+        for i in range(1, n+1):
+            for j in range(max(1, i-max_warp), min(m, i+max_warp)+1):
+                cost = abs(float(a[i-1]) - float(b[j-1]))
+                dtw_matrix[i, j] = cost + min(dtw_matrix[i-1, j], dtw_matrix[i, j-1], dtw_matrix[i-1, j-1])
+        return float(dtw_matrix[n, m])
+
+    @classmethod
+    def match(cls, new_sig, stored_sig):
+        a, b = np.array(new_sig), np.array(stored_sig)
+        cos_sim = cls.cosine_similarity(a, b)
+        seg_len = min(32, len(a)//4)
+        if seg_len > 4:
+            dtw_scores = []
+            for start in range(0, len(a) - seg_len, seg_len):
+                d = cls.dtw_distance(a[start:start+seg_len], b[start:start+seg_len])
+                dtw_scores.append(1.0 / (1.0 + d))
+            dtw_avg = np.mean(dtw_scores) if dtw_scores else 0.0
+        else:
+            dtw_avg = cos_sim
+        return round(float(0.65 * cos_sim + 0.35 * dtw_avg), 4)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIMULATED CSI SOURCE
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SimulatedCSISource:
+    """
+    Generates realistic synthetic CSI data with simulated humans and animals.
+    Each entity has unique biometrics and movement patterns.
+    """
+
+    def __init__(self, n_people=3, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+        self.people = []
+        self.n_subcarriers = N_SUBCARRIERS
+        self.sample_rate = CSI_SAMPLE_RATE
+
+        # Create distinct simulated entities (mix of humans and animals)
+        entities = [
+            # Humans with sex-differentiated biometrics
+            {'id': 'Entity_A', 'type': 'human', 'sex': 'male',
+             'heart_rate': np.random.uniform(62, 78), 'resp_rate': np.random.uniform(13, 18),
+             'gait_cadence': np.random.uniform(95, 115), 'body_attenuation': np.random.uniform(0.55, 0.80),
+             'gait_asymmetry': np.random.uniform(0.88, 0.98)},
+            {'id': 'Entity_B', 'type': 'human', 'sex': 'female',
+             'heart_rate': np.random.uniform(68, 88), 'resp_rate': np.random.uniform(14, 20),
+             'gait_cadence': np.random.uniform(108, 128), 'body_attenuation': np.random.uniform(0.35, 0.55),
+             'gait_asymmetry': np.random.uniform(0.90, 0.99)},
+            {'id': 'Entity_C', 'type': 'human', 'sex': 'male',
+             'heart_rate': np.random.uniform(58, 72), 'resp_rate': np.random.uniform(12, 16),
+             'gait_cadence': np.random.uniform(100, 118), 'body_attenuation': np.random.uniform(0.60, 0.85),
+             'gait_asymmetry': np.random.uniform(0.85, 0.95)},
+            # Dog
+            {'id': 'Entity_D', 'type': 'dog', 'sex': 'unknown',
+             'heart_rate': np.random.uniform(80, 130), 'resp_rate': np.random.uniform(18, 28),
+             'gait_cadence': np.random.uniform(170, 230), 'body_attenuation': np.random.uniform(0.15, 0.35),
+             'gait_asymmetry': np.random.uniform(0.70, 0.85)},
+            # Cat
+            {'id': 'Entity_E', 'type': 'cat', 'sex': 'unknown',
+             'heart_rate': np.random.uniform(140, 200), 'resp_rate': np.random.uniform(20, 30),
+             'gait_cadence': np.random.uniform(190, 260), 'body_attenuation': np.random.uniform(0.08, 0.20),
+             'gait_asymmetry': np.random.uniform(0.65, 0.80)},
+        ]
+
+        for i, ent in enumerate(entities[:max(n_people, 5)]):
+            ent['heart_variability'] = np.random.uniform(0.02, 0.08)
+            ent['stride_length'] = np.random.uniform(0.6, 0.85) if ent['type'] == 'human' else np.random.uniform(0.2, 0.5)
+            ent['subcarrier_profile'] = np.random.dirichlet(np.ones(N_SUBCARRIERS) * 2)
+            ent['phase_offset'] = np.random.uniform(0, 2 * np.pi)
+            ent['active'] = True
+            ent['position'] = np.random.uniform(-5, 5, size=2)
+            # Movement direction: +1 approaching, -1 receding, 0 stationary
+            ent['move_direction'] = np.random.choice([-1, 0, 1])
+            ent['radial_speed'] = np.random.uniform(0.3, 1.8) if ent['type'] == 'human' else np.random.uniform(0.5, 3.0)
+            self.people.append(ent)
+
+        self._time = 0.0
+        self._direction_change_timer = 0
+
+    def toggle_person(self, idx):
+        if idx < len(self.people):
+            self.people[idx]['active'] = not self.people[idx]['active']
+
+    def generate_frames(self, n_frames):
+        frames = []
+        dt = 1.0 / self.sample_rate
+
+        # Periodically change movement directions
+        self._direction_change_timer += n_frames
+        if self._direction_change_timer > self.sample_rate * 8:
+            self._direction_change_timer = 0
+            for p in self.people:
+                if np.random.random() < 0.4:
+                    p['move_direction'] = np.random.choice([-1, 0, 0, 1])  # bias toward stationary
+
+        for _ in range(n_frames):
+            t = self._time
+            amps = np.ones(self.n_subcarriers) * 0.1
+            phases = np.random.uniform(-0.1, 0.1, self.n_subcarriers)
+
+            for p in self.people:
+                if not p['active']:
+                    continue
+
+                hr_freq = p['heart_rate'] / 60.0
+                hrv = p['heart_variability'] * np.sin(2 * np.pi * 0.1 * t)
+                hb = p['body_attenuation'] * 0.02 * np.sin(2 * np.pi * (hr_freq + hrv) * t + p['phase_offset'])
+                hb += p['body_attenuation'] * 0.008 * np.sin(2 * np.pi * 2 * hr_freq * t + p['phase_offset'])
+
+                resp_freq = p['resp_rate'] / 60.0
+                resp = p['body_attenuation'] * 0.05 * np.sin(2 * np.pi * resp_freq * t)
+
+                gait_freq = p['gait_cadence'] / 60.0
+                gait = p['body_attenuation'] * 0.15 * (
+                    np.sin(2 * np.pi * gait_freq * t) +
+                    p['gait_asymmetry'] * 0.3 * np.sin(2 * np.pi * 2 * gait_freq * t + 0.5)
+                )
+                gait += p['body_attenuation'] * 0.04 * np.sin(2 * np.pi * 2 * gait_freq * t + np.pi/4)
+
+                person_signal = (hb + resp + gait) * p['subcarrier_profile'] * self.n_subcarriers
+                amps += person_signal
+
+                # Doppler phase shift based on movement direction
+                doppler_base = 0.1 * gait_freq * np.cos(2 * np.pi * gait_freq * t)
+                # Add consistent phase drift for direction
+                direction_drift = p['move_direction'] * p['radial_speed'] * 2 * np.pi / WAVELENGTH
+                phases += (doppler_base + direction_drift * dt) * p['subcarrier_profile'] * 5
+
+            amps += np.random.normal(0, 0.005, self.n_subcarriers)
+            phases += np.random.normal(0, 0.02, self.n_subcarriers)
+
+            frames.append(CSIFrame(timestamp=t, amplitudes=np.abs(amps), phases=phases))
+            self._time += dt
+
+        return frames
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROFILE STORAGE
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ProfileStore:
+    def __init__(self, filepath='profiles.json'):
+        self.filepath = filepath
+        self._lock = threading.Lock()
+        self.profiles = self._load()
+
+    def _load(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return {}
+        return {}
+
+    def _save(self):
+        with open(self.filepath, 'w') as f:
+            json.dump(self.profiles, f, indent=2, default=str)
+
+    def _generate_id(self, signature):
+        sig_bytes = np.array(signature).tobytes()
+        return hashlib.sha256(sig_bytes).hexdigest()[:12]
+
+    def add_or_update(self, sig_type, signature, metadata, match_id=None, confidence=0.0):
+        with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            if match_id and match_id in self.profiles:
+                profile = self.profiles[match_id]
+                profile['last_seen'] = now
+                profile['detection_count'] += 1
+                profile['confidence_history'].append(confidence)
+                profile['confidence_history'] = profile['confidence_history'][-50:]
+                profile['avg_confidence'] = round(np.mean(profile['confidence_history']), 4)
+                old_sig = np.array(profile['signature'])
+                new_sig = np.array(signature)
+                alpha = 0.15
+                updated = (1 - alpha) * old_sig + alpha * new_sig
+                updated = updated / (np.linalg.norm(updated) + 1e-10)
+                profile['signature'] = updated.tolist()
+                for k, v in metadata.items():
+                    if k != 'signature':
+                        profile['metadata'][k] = v
+                self._save()
+                return profile
+            else:
+                profile_id = self._generate_id(signature)
+                profile = {
+                    'id': profile_id, 'nickname': None, 'sig_type': sig_type,
+                    'signature': signature, 'first_seen': now, 'last_seen': now,
+                    'detection_count': 1,
+                    'confidence_history': [confidence] if confidence > 0 else [],
+                    'avg_confidence': confidence, 'metadata': metadata, 'tagged': False,
+                }
+                self.profiles[profile_id] = profile
+                self._save()
+                return profile
+
+    def tag_profile(self, profile_id, nickname):
+        with self._lock:
+            if profile_id in self.profiles:
+                self.profiles[profile_id]['nickname'] = nickname
+                self.profiles[profile_id]['tagged'] = True
+                self._save()
+                return self.profiles[profile_id]
+            return None
+
+    def delete_profile(self, profile_id):
+        with self._lock:
+            if profile_id in self.profiles:
+                profile = self.profiles[profile_id]
+                sig_len = len(profile.get('signature', []))
+                profile['signature'] = np.random.random(sig_len).tolist()
+                profile['metadata'] = {}
+                profile['nickname'] = None
+                profile['confidence_history'] = []
+                del self.profiles[profile_id]
+                self._save()
+                self._save()
+                return True
+            return False
+
+    def get_all(self):
+        with self._lock:
+            result = []
+            for pid, p in self.profiles.items():
+                entry = {k: v for k, v in p.items() if k != 'signature'}
+                entry['has_signature'] = len(p.get('signature', [])) > 0
+                entry['signature_strength'] = float(np.linalg.norm(p.get('signature', [])))
+                result.append(entry)
+            return result
+
+    def get_signatures_for_matching(self):
+        with self._lock:
+            return [
+                {'id': pid, 'sig_type': p['sig_type'], 'signature': p['signature'], 'nickname': p.get('nickname')}
+                for pid, p in self.profiles.items()
+            ]
+
+    def set_device_candidates(self, profile_id: str, candidates: list):
+        """Store ranked device name candidates for a profile (for UI display)."""
+        with self._lock:
+            if profile_id in self.profiles:
+                self.profiles[profile_id]['device_candidates'] = candidates
+                self._save()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DEVICE CORRELATOR
+# ═════════════════════════════════════════════════════════════════════════════
+
+class DeviceCorrelator:
+    """
+    Correlates CSI-detected subject profiles with nearby device display names.
+
+    Each detection cycle, record which profiles were active and which devices
+    were visible. This builds a co-presence count matrix:
+
+        co_presence[profile_id][device_key] = N times seen together
+
+    Correlation score = co_presence_count / total_profile_detections.
+
+    Workflow:
+      1. Detection cycle runs → call record_window(profile_ids, visible_devices)
+      2. Operator sees a profile and suspects it's "Knibb High Football Rules"
+         → call suggest(profile_id, "Knibb High Football Rules")
+      3. System keeps accumulating co-presence data for that suggestion
+      4. Once score ≥ AUTO_CONFIRM_THRESHOLD for ≥ AUTO_TAG_MIN_SIGHTINGS,
+         check_auto_associations() returns it → server calls store.tag_profile()
+    """
+
+    # Confidence threshold to auto-confirm a suggested device→subject association
+    AUTO_CONFIRM_THRESHOLD = 0.82
+    # Minimum co-presence observations before auto-tag fires (avoids early false positives)
+    AUTO_TAG_MIN_SIGHTINGS = 10
+
+    def __init__(self, profile_store: 'ProfileStore'):
+        self._store = profile_store
+        self._lock = threading.Lock()
+        # co_presence[profile_id][device_key] = int count
+        self._co_presence: dict = defaultdict(lambda: defaultdict(int))
+        # total detection windows per profile
+        self._detection_counts: dict = defaultdict(int)
+        # operator-suggested associations: profile_id → [display_name, ...]
+        self._suggestions: dict = defaultdict(list)
+        # already auto-tagged pairs so we don't re-fire
+        self._confirmed: set = set()
+
+    def record_window(self, profile_ids: list, visible_devices: dict):
+        """
+        Call once per detection cycle.
+
+        profile_ids: list of profile IDs that matched in this window
+        visible_devices: dict returned by DeviceScanner.get_visible()
+        """
+        with self._lock:
+            for pid in profile_ids:
+                self._detection_counts[pid] += 1
+                for dev_key in visible_devices:
+                    self._co_presence[pid][dev_key] += 1
+
+    def suggest(self, profile_id: str, device_display_name: str):
+        """
+        Operator manually suggests that profile_id belongs to device_display_name.
+        The system will auto-confirm once co-presence confidence is high enough.
+        """
+        with self._lock:
+            if device_display_name not in self._suggestions[profile_id]:
+                self._suggestions[profile_id].append(device_display_name)
+                logger.info(
+                    f"[DeviceCorrelator] Suggestion queued: "
+                    f"profile {profile_id} → '{device_display_name}'"
+                )
+
+    def get_candidates(self, profile_id: str, visible_devices: dict) -> list:
+        """
+        Returns ranked device candidates for a profile:
+          [{'display_name', 'device_key', 'score', 'sightings', 'suggested'}, ...]
+
+        Score = co-presence fraction (0–1). Suggested entries sort first.
+        """
+        with self._lock:
+            total = self._detection_counts.get(profile_id, 0)
+            if total == 0:
+                return []
+
+            results = []
+            for dev_key, count in self._co_presence.get(profile_id, {}).items():
+                dev_info = visible_devices.get(dev_key, {})
+                display_name = dev_info.get('display_name', dev_key)
+                suggested = display_name in self._suggestions.get(profile_id, [])
+                results.append({
+                    'display_name': display_name,
+                    'device_key': dev_key,
+                    'score': round(count / total, 3),
+                    'sightings': count,
+                    'suggested': suggested,
+                })
+
+            results.sort(key=lambda x: (-int(x['suggested']), -x['score']))
+            return results
+
+    def check_auto_associations(self, visible_devices: dict) -> list:
+        """
+        Returns list of (profile_id, display_name, score) tuples that have
+        accumulated enough co-presence evidence to be auto-confirmed.
+
+        Call this each detection cycle; the server should then call
+        store.tag_profile() for each returned pair.
+        """
+        to_tag = []
+        with self._lock:
+            for pid, suggestions in self._suggestions.items():
+                total = self._detection_counts.get(pid, 0)
+                if total < self.AUTO_TAG_MIN_SIGHTINGS:
+                    continue
+                for display_name in suggestions:
+                    pair = (pid, display_name)
+                    if pair in self._confirmed:
+                        continue
+                    # Find the device key(s) matching this display name
+                    for dev_key, count in self._co_presence.get(pid, {}).items():
+                        dev_info = visible_devices.get(dev_key, {})
+                        if dev_info.get('display_name', '') == display_name:
+                            score = count / total
+                            if score >= self.AUTO_CONFIRM_THRESHOLD:
+                                to_tag.append((pid, display_name, round(score, 3)))
+                                self._confirmed.add(pair)
+                                logger.info(
+                                    f"[DeviceCorrelator] Auto-confirmed: "
+                                    f"profile {pid} → '{display_name}' "
+                                    f"(score={score:.3f}, n={count}/{total})"
+                                )
+                            break
+        return to_tag
