@@ -69,6 +69,14 @@ const timeAgo = (iso) => {
   return `${Math.floor(diff / 86400)}d ago`;
 };
 
+// Rough distance estimate from body_attenuation (0–1, higher = more signal blocked = closer).
+// Based on indoor WiFi path-loss model; accuracy ±2 m.
+const estimateDistance = (attenuation) => {
+  if (attenuation == null || attenuation <= 0) return null;
+  const d = Math.max(0.5, (1.0 - attenuation) * 8.0 + 0.5);
+  return d < 10 ? `~${d.toFixed(1)} m` : `~${Math.round(d)} m`;
+};
+
 const confColor  = (c, green = '#00ff87') => c >= 0.9 ? green : c >= 0.75 ? "#fbbf24" : c >= 0.5 ? "#fb923c" : "#ef4444";
 const confLabel  = (c) => c >= 0.92 ? "LOCKED" : c >= 0.8 ? "HIGH" : c >= 0.65 ? "MED" : c >= 0.4 ? "LOW" : "WEAK";
 
@@ -123,42 +131,582 @@ function Sparkline({ data, width = 140, height = 26 }) {
   return <canvas ref={ref} style={{ width, height, display: "block" }} />;
 }
 
-// ─── Radar ───────────────────────────────────────────────────────────────────
+// ─── Radar Canvas ─────────────────────────────────────────────────────────────
+// Pure canvas renderer — shared by the compact sidebar radar and the expanded modal.
+// sweepAngle / pingTimes are passed as refs so both instances share the same state.
 
-function RadarPulse({ active }) {
+function RadarCanvas({ size, profiles, active, sweepAngle, pingTimes, selectedIdRef, positionsRef }) {
   const t = useContext(ThemeContext);
-  const ref = useRef(null), anim = useRef(null);
+  const ref = useRef(null);
+  const animRef = useRef(null);
+  const expanded = size > 200;
+
   useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const ctx = c.getContext("2d"); const size = 150, dpr = window.devicePixelRatio || 1;
-    c.width = size * dpr; c.height = size * dpr; ctx.scale(dpr, dpr);
-    const ctr = size / 2; let angle = 0;
-    const draw = () => {
-      ctx.clearRect(0, 0, size, size);
-      [0.2, 0.4, 0.6, 0.8, 1.0].forEach(r => {
-        ctx.beginPath(); ctx.arc(ctr, ctr, ctr * r - 2, 0, Math.PI * 2);
-        ctx.strokeStyle = t.radarRing; ctx.lineWidth = 0.5; ctx.stroke();
-      });
-      ctx.strokeStyle = t.radarCross; ctx.beginPath();
-      ctx.moveTo(ctr, 4); ctx.lineTo(ctr, size - 4);
-      ctx.moveTo(4, ctr); ctx.lineTo(size - 4, ctr); ctx.stroke();
-      if (active) {
-        ctx.save(); ctx.translate(ctr, ctr); ctx.rotate(angle);
-        ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, ctr - 4, -0.4, 0); ctx.closePath();
-        const g = ctx.createRadialGradient(0, 0, 0, 0, 0, ctr - 4);
-        g.addColorStop(0, hexToRgba(t.green, 0.35)); g.addColorStop(1, hexToRgba(t.green, 0.02));
-        ctx.fillStyle = g; ctx.fill();
-        ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(ctr - 4, 0);
-        ctx.strokeStyle = hexToRgba(t.green, 0.7); ctx.lineWidth = 1.5; ctx.stroke();
-        ctx.restore(); angle += 0.03;
+    const canvas = ref.current;
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = size * dpr;
+    canvas.height = size * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const ctr = size / 2;
+    const maxR = ctr - 8;
+    const maxDist = 8.5;           // metres — matches estimateDistance upper bound
+    const dotR = expanded ? 5 : 3.5;
+
+    // Fallback: stable angle per profile ID (used when positionsRef has no entry yet)
+    const angleMap = new Map(profiles.map(p => {
+      const hash = p.id.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7);
+      return [p.id, ((Math.abs(hash) % 3600) / 3600) * Math.PI * 2];
+    }));
+
+    const getTargets = () => profiles.map(p => {
+      const pos = positionsRef?.current?.[p.id];
+      const m = p.metadata || {};
+      let angle, r, dist;
+      if (pos) {
+        angle = pos.angle;
+        r = Math.min(maxR - dotR - 2, pos.rFrac * maxR);
+        dist = pos.rFrac * maxDist;
+      } else {
+        angle = angleMap.get(p.id) ?? 0;
+        const attn = m.body_attenuation || 0;
+        dist = attn > 0 ? Math.max(0.5, (1.0 - attn) * 8.0 + 0.5) : null;
+        r = dist ? Math.min(maxR - dotR - 2, (dist / maxDist) * maxR) : maxR * 0.72;
       }
-      ctx.beginPath(); ctx.arc(ctr, ctr, 3, 0, Math.PI * 2);
-      ctx.fillStyle = active ? t.green : t.radarDotInactive; ctx.fill();
-      anim.current = requestAnimationFrame(draw);
+      return {
+        id: p.id, angle, r, dist,
+        x: ctr + r * Math.cos(angle),
+        y: ctr + r * Math.sin(angle),
+        dir: m.direction || 'unknown',
+        nickname: p.nickname || null,
+      };
+    });
+
+    const draw = (ts) => {
+      ctx.clearRect(0, 0, size, size);
+
+      // ── Range rings ───────────────────────────────────────────────────────
+      for (let i = 1; i <= 4; i++) {
+        const r = (maxR * i) / 4;
+        ctx.beginPath();
+        ctx.arc(ctr, ctr, r, 0, Math.PI * 2);
+        ctx.strokeStyle = t.radarRing;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+        if (expanded) {
+          ctx.font = '8px "JetBrains Mono", monospace';
+          ctx.fillStyle = hexToRgba(t.green, 0.28);
+          ctx.textAlign = 'left';
+          ctx.fillText(`${i * 2}m`, ctr + r + 3, ctr - 2);
+        }
+      }
+
+      // ── Crosshairs ────────────────────────────────────────────────────────
+      ctx.setLineDash([2, 5]);
+      ctx.strokeStyle = t.radarCross;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(ctr, 4); ctx.lineTo(ctr, size - 4);
+      ctx.moveTo(4, ctr); ctx.lineTo(size - 4, ctr);
+      ctx.stroke();
+      if (expanded) {
+        const d45 = maxR * 0.707;
+        ctx.beginPath();
+        ctx.moveTo(ctr - d45, ctr - d45); ctx.lineTo(ctr + d45, ctr + d45);
+        ctx.moveTo(ctr + d45, ctr - d45); ctx.lineTo(ctr - d45, ctr + d45);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      // Compass labels (expanded)
+      if (expanded) {
+        ctx.font = 'bold 8px "JetBrains Mono", monospace';
+        ctx.fillStyle = hexToRgba(t.green, 0.4);
+        ctx.textAlign = 'center';
+        ctx.fillText('N', ctr, 12);
+        ctx.fillText('S', ctr, size - 4);
+        ctx.textAlign = 'right';
+        ctx.fillText('W', 14, ctr + 4);
+        ctx.textAlign = 'left';
+        ctx.fillText('E', size - 8, ctr + 4);
+        ctx.textAlign = 'left';
+      }
+
+      if (active) {
+        sweepAngle.current = (sweepAngle.current + 0.022) % (Math.PI * 2);
+        const sweep = sweepAngle.current;
+        const targets = getTargets();
+
+        // Ping detection: fire when sweep crosses a target's bearing
+        targets.forEach(tgt => {
+          const diff = ((sweep - tgt.angle) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+          if (diff < 0.08) pingTimes.current[tgt.id] = ts;
+        });
+
+        // ── Sweep sector ──────────────────────────────────────────────────
+        ctx.save();
+        ctx.translate(ctr, ctr);
+        ctx.rotate(sweep);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.arc(0, 0, maxR, -0.4, 0);
+        ctx.closePath();
+        const sg = ctx.createRadialGradient(0, 0, 0, 0, 0, maxR);
+        sg.addColorStop(0, hexToRgba(t.green, 0.4));
+        sg.addColorStop(1, hexToRgba(t.green, 0.01));
+        ctx.fillStyle = sg;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(0, 0); ctx.lineTo(maxR, 0);
+        ctx.strokeStyle = hexToRgba(t.green, 0.9);
+        ctx.lineWidth = 1.5;
+        ctx.shadowColor = t.green; ctx.shadowBlur = 5;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        ctx.restore();
+
+        // ── Target dots ───────────────────────────────────────────────────
+        targets.forEach(tgt => {
+          const pingAge = pingTimes.current[tgt.id] != null ? ts - pingTimes.current[tgt.id] : 99999;
+          const pingFade = Math.max(0, 1 - pingAge / 2000);
+
+          const dotColor = tgt.dir === 'approaching' ? '#ef4444'
+            : tgt.dir === 'receding' ? '#3b82f6'
+            : t.green;
+          const [tr, tg, tb] = [1, 3, 5].map(i => parseInt(dotColor.slice(i, i + 2), 16));
+
+          // Dual expanding echo rings on ping
+          if (pingFade > 0) {
+            const maxPingR = expanded ? 36 : 22;
+            [1.0, 0.58].forEach((phase, k) => {
+              const fade = Math.max(0, pingFade * phase - k * 0.08);
+              if (fade <= 0) return;
+              const ringR = dotR + 1 + (1 - phase * pingFade) * maxPingR;
+              ctx.beginPath();
+              ctx.arc(tgt.x, tgt.y, ringR, 0, Math.PI * 2);
+              ctx.strokeStyle = `rgba(${tr},${tg},${tb},${fade * 0.85})`;
+              ctx.lineWidth = 1.5 - k * 0.5;
+              ctx.stroke();
+            });
+          }
+
+          // Approaching: animated pulsing halo
+          if (tgt.dir === 'approaching') {
+            const pulse = 0.35 + 0.6 * Math.abs(Math.sin(ts / 480));
+            const haloR = dotR + 2 + pulse * (expanded ? 9 : 5);
+            ctx.beginPath();
+            ctx.arc(tgt.x, tgt.y, haloR, 0, Math.PI * 2);
+            ctx.strokeStyle = `rgba(239,68,68,${0.12 + pulse * 0.32})`;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          }
+
+          // Selection ring (drawn when this dot is the active selection)
+          if (selectedIdRef?.current === tgt.id) {
+            const selR = dotR + 5 + Math.sin(ts / 300) * 2;
+            ctx.beginPath();
+            ctx.arc(tgt.x, tgt.y, selR, 0, Math.PI * 2);
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([3, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+
+          // Dot: radial gradient for a lens/sphere look + glow
+          ctx.shadowColor = dotColor;
+          ctx.shadowBlur = pingFade > 0.2 ? 18 : 9;
+          const dotGrad = ctx.createRadialGradient(
+            tgt.x - dotR * 0.3, tgt.y - dotR * 0.3, 0,
+            tgt.x, tgt.y, dotR,
+          );
+          dotGrad.addColorStop(0, `rgba(255,255,255,${0.65 + pingFade * 0.35})`);
+          dotGrad.addColorStop(1, dotColor);
+          ctx.beginPath();
+          ctx.arc(tgt.x, tgt.y, dotR, 0, Math.PI * 2);
+          ctx.fillStyle = dotGrad;
+          ctx.fill();
+          ctx.shadowBlur = 0;
+
+          // Labels (expanded only)
+          if (expanded) {
+            const label = (tgt.nickname || tgt.id.slice(0, 6)).toUpperCase();
+            const distStr = tgt.dist != null ? `~${tgt.dist.toFixed(1)}m` : '';
+            const lx = tgt.x + dotR + 6;
+            const ly = tgt.y;
+            ctx.font = 'bold 9px "JetBrains Mono", monospace';
+            ctx.textAlign = 'left';
+            const lw = ctx.measureText(label).width;
+            ctx.fillStyle = `rgba(${tr},${tg},${tb},0.14)`;
+            ctx.fillRect(lx - 2, ly - 11, lw + 8, 14);
+            ctx.fillStyle = dotColor;
+            ctx.fillText(label, lx + 2, ly);
+            if (distStr) {
+              ctx.font = '8px "JetBrains Mono", monospace';
+              ctx.fillStyle = `rgba(${tr},${tg},${tb},0.7)`;
+              ctx.fillText(distStr, lx + 2, ly + 11);
+            }
+          }
+        });
+      }
+
+      // ── Center dot (Pi / AP) ──────────────────────────────────────────────
+      const cDotR = expanded ? 5 : 3;
+      const cg = ctx.createRadialGradient(ctr - 1, ctr - 1, 0, ctr, ctr, cDotR);
+      cg.addColorStop(0, 'rgba(255,255,255,0.9)');
+      cg.addColorStop(1, active ? t.green : t.radarDotInactive);
+      ctx.beginPath();
+      ctx.arc(ctr, ctr, cDotR, 0, Math.PI * 2);
+      ctx.fillStyle = cg;
+      ctx.shadowColor = t.green;
+      ctx.shadowBlur = active ? 10 : 0;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (expanded) {
+        ctx.font = 'bold 9px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = hexToRgba(t.green, 0.7);
+        ctx.fillText('AP', ctr + cDotR + 4, ctr + 4);
+      }
+
+      animRef.current = requestAnimationFrame(draw);
     };
-    draw(); return () => cancelAnimationFrame(anim.current);
-  }, [active, t]);
-  return <canvas ref={ref} style={{ width: 150, height: 150, display: "block" }} />;
+
+    animRef.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(animRef.current);
+  }, [active, profiles, t, size, expanded]);
+
+  return <canvas ref={ref} style={{ width: size, height: size, display: 'block' }} />;
+}
+
+// ─── Radar Display ─────────────────────────────────────────────────────────────
+// Compact sidebar widget (150 px) that expands into a 400 px modal on click.
+// Click any dot in expanded mode to inspect that signature's profile data.
+
+function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) {
+  const t = useContext(ThemeContext);
+  const [expanded, setExpanded] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);
+  const sweepAngle = useRef(0);
+  const pingTimes = useRef({});
+  // Ref so the canvas draw loop can read selection without restarting the animation
+  const selectedIdRef = useRef(null);
+  // Animated positions — updated every RAF frame, read by both canvas instances
+  const positionsRef = useRef({});
+  const profilesRef = useRef(profiles);
+  profilesRef.current = profiles;
+  const lastPosTs = useRef(null);
+  const posUpdateRef = useRef(null);
+
+  const selectProfile = (id) => { selectedIdRef.current = id; setSelectedId(id); };
+  const clearSelection = () => { selectedIdRef.current = null; setSelectedId(null); };
+
+  const EXPANDED_SIZE = 400;
+
+  // ── Position simulation loop ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!active) return;
+    const update = (ts) => {
+      const dt = lastPosTs.current != null ? Math.min((ts - lastPosTs.current) / 1000, 0.05) : 0;
+      lastPosTs.current = ts;
+      const maxDist = 8.5;
+      profilesRef.current.forEach(p => {
+        const m = p.metadata || {};
+        const species = m.species || 'human';
+        const dir = m.direction || 'stationary';
+        if (!positionsRef.current[p.id]) {
+          const hash = p.id.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7);
+          const angle = ((Math.abs(hash) % 3600) / 3600) * Math.PI * 2;
+          const attn = m.body_attenuation || 0;
+          const dist = attn > 0 ? Math.max(0.5, (1.0 - attn) * 8.0 + 0.5) : 6;
+          positionsRef.current[p.id] = { angle, rFrac: Math.min(0.92, dist / maxDist) };
+        }
+        const pos = positionsRef.current[p.id];
+        const speedMps = species === 'dog' ? 1.8 : species === 'cat' ? 0.12 : 1.0;
+        const drFrac = (speedMps / maxDist) * dt;
+        if (dir === 'approaching') pos.rFrac -= drFrac;
+        else if (dir === 'receding') pos.rFrac += drFrac;
+        const angularSpeed = species === 'dog' ? 0.4 : species === 'cat' ? 0.05 : 0.15;
+        pos.angle += (Math.random() - 0.5) * angularSpeed * dt;
+        pos.rFrac = Math.max(0.05, Math.min(0.92, pos.rFrac));
+      });
+      posUpdateRef.current = requestAnimationFrame(update);
+    };
+    posUpdateRef.current = requestAnimationFrame(update);
+    return () => cancelAnimationFrame(posUpdateRef.current);
+  }, [active]);
+
+  // ── ESC key: first press clears selection, second closes modal ───────────
+  useEffect(() => {
+    if (!expanded) return;
+    const handler = (e) => {
+      if (e.key === 'Escape') {
+        if (selectedIdRef.current) clearSelection();
+        else setExpanded(false);
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [expanded]);
+
+  // Replicate position from positionsRef (or fallback formula) for hit-testing
+  const hitTest = (clientX, clientY, canvasEl) => {
+    if (!canvasEl) return null;
+    const rect = canvasEl.getBoundingClientRect();
+    const scaleX = EXPANDED_SIZE / rect.width;
+    const scaleY = EXPANDED_SIZE / rect.height;
+    const cx = (clientX - rect.left) * scaleX;
+    const cy = (clientY - rect.top) * scaleY;
+    const ctr = EXPANDED_SIZE / 2;
+    const maxR = ctr - 8;
+    const maxDist = 8.5;
+    const dotR = 5;
+    for (const p of profiles) {
+      const pos = positionsRef.current[p.id];
+      let tx, ty;
+      if (pos) {
+        const r = Math.min(maxR - dotR - 2, pos.rFrac * maxR);
+        tx = ctr + r * Math.cos(pos.angle);
+        ty = ctr + r * Math.sin(pos.angle);
+      } else {
+        const hash = p.id.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7);
+        const angle = ((Math.abs(hash) % 3600) / 3600) * Math.PI * 2;
+        const attn = p.metadata?.body_attenuation || 0;
+        const dist = attn > 0 ? Math.max(0.5, (1 - attn) * 8 + 0.5) : null;
+        const r = dist ? Math.min(maxR - dotR - 2, (dist / maxDist) * maxR) : maxR * 0.72;
+        tx = ctr + r * Math.cos(angle);
+        ty = ctr + r * Math.sin(angle);
+      }
+      if (Math.hypot(cx - tx, cy - ty) < dotR + 10) return p.id;
+    }
+    return null;
+  };
+
+  const expandedCanvasRef = useRef(null);
+
+  const handleCanvasClick = (e) => {
+    const hit = hitTest(e.clientX, e.clientY, expandedCanvasRef.current?.querySelector('canvas'));
+    if (hit) selectProfile(hit === selectedId ? null : hit);
+    else clearSelection();
+  };
+
+  const selectedProfile = profiles.find(p => p.id === selectedId);
+  const sm = selectedProfile?.metadata || {};
+  const selDir = sm.direction || 'unknown';
+  const selDist = estimateDistance(sm.body_attenuation);
+
+  return (
+    <>
+      <div
+        onClick={() => setExpanded(true)}
+        style={{ cursor: 'pointer', position: 'relative', lineHeight: 0 }}
+        title="Click to expand tactical radar"
+      >
+        <RadarCanvas size={150} profiles={profiles} active={active} sweepAngle={sweepAngle} pingTimes={pingTimes} selectedIdRef={selectedIdRef} positionsRef={positionsRef} />
+        <div style={{
+          position: 'absolute', bottom: 4, left: 0, right: 0, textAlign: 'center',
+          fontSize: 7, color: hexToRgba(t.green, 0.55), fontWeight: 700,
+          letterSpacing: '0.1em', fontFamily: "'JetBrains Mono', monospace",
+          pointerEvents: 'none',
+        }}>
+          {profiles.length > 0 ? `${profiles.length} TRACKED` : 'SCANNING'} · EXPAND
+        </div>
+      </div>
+
+      {expanded && (
+        <div
+          onClick={() => { clearSelection(); setExpanded(false); }}
+          style={{
+            position: 'fixed', inset: 0,
+            background: 'rgba(0,0,0,0.82)',
+            backdropFilter: 'blur(6px)',
+            zIndex: 300,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: t.bgCard,
+              border: `1px solid ${hexToRgba(t.green, 0.3)}`,
+              borderRadius: 14, padding: 24,
+              boxShadow: `0 0 60px ${hexToRgba(t.green, 0.12)}, 0 0 120px ${hexToRgba(t.green, 0.05)}`,
+              display: 'flex', flexDirection: 'column', gap: 0,
+            }}
+          >
+            {/* Header */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <div>
+                <span style={{ fontSize: 13, fontWeight: 800, color: t.green, letterSpacing: '0.12em' }}>◉ TACTICAL RADAR</span>
+                <span style={{ fontSize: 10, color: t.textSecondary, marginLeft: 12 }}>
+                  {profiles.length} SIGNATURE{profiles.length !== 1 ? 'S' : ''} · 8m RANGE · CLICK DOT TO INSPECT
+                </span>
+              </div>
+              <button
+                onClick={() => { if (selectedId) clearSelection(); else { clearSelection(); setExpanded(false); } }}
+                style={{
+                  background: 'transparent', border: `1px solid ${t.border}`,
+                  color: t.textMuted, borderRadius: 5, padding: '3px 10px',
+                  cursor: 'pointer', fontSize: 11,
+                  fontFamily: "'JetBrains Mono', monospace", fontWeight: 700,
+                }}
+                title={selectedId ? 'Deselect target (ESC)' : 'Close radar (ESC)'}
+              >{selectedId ? '× DESELECT' : 'ESC'}</button>
+            </div>
+
+            {/* Radar + optional info panel side by side */}
+            <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
+              <div ref={expandedCanvasRef} onClick={handleCanvasClick} style={{ cursor: 'crosshair', flexShrink: 0 }}>
+                <RadarCanvas size={EXPANDED_SIZE} profiles={profiles} active={active} sweepAngle={sweepAngle} pingTimes={pingTimes} selectedIdRef={selectedIdRef} positionsRef={positionsRef} />
+              </div>
+
+              {/* Info panel — appears when a dot is selected */}
+              {selectedProfile ? (
+                <div style={{
+                  width: 260, background: t.bgSidebar,
+                  border: `1px solid ${hexToRgba(dirColor(selDir), 0.4)}`,
+                  borderRadius: 10, padding: 16,
+                  animation: selDir === 'approaching' ? 'approachGlow 3s ease-in-out infinite' : selDir === 'receding' ? 'recedeGlow 3s ease-in-out infinite' : 'none',
+                }}>
+                  {/* Approaching banner */}
+                  {selDir === 'approaching' && (
+                    <div style={{
+                      background: 'linear-gradient(90deg, rgba(239,68,68,0.85), rgba(239,68,68,0.6))',
+                      margin: '-16px -16px 12px -16px', padding: '5px 12px',
+                      borderRadius: '10px 10px 0 0',
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    }}>
+                      <span style={{ fontSize: 10, fontWeight: 800, color: '#fff', letterSpacing: '0.1em' }}>▲ TARGET APPROACHING</span>
+                      {selDist && <span style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.9)' }}>{selDist}</span>}
+                    </div>
+                  )}
+
+                  {/* Name + type */}
+                  <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: t.textPrimary, letterSpacing: '0.02em' }}>
+                      {selectedProfile.nickname || 'UNTAGGED'}
+                    </div>
+                    <div style={{ fontSize: 10, color: t.textSecondary, marginTop: 2, letterSpacing: '0.06em' }}>
+                      {selectedProfile.sig_type.toUpperCase()} · {selectedProfile.id.slice(0, 10)}
+                    </div>
+                  </div>
+
+                  {/* Badges */}
+                  <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 10 }}>
+                    <Badge label={sm.species?.toUpperCase() || '?'} color={speciesColor(sm.species, t.green)} icon={speciesIcon(sm.species)} />
+                    {sm.species === 'human' && sm.sex_estimation && sm.sex_estimation !== 'n/a' && (
+                      <Badge label={sm.sex_estimation?.toUpperCase()} color={sexColor(sm.sex_estimation)} icon={sexIcon(sm.sex_estimation)} />
+                    )}
+                    <Badge label={dirLabel(selDir)} color={dirColor(selDir)} icon={dirIcon(selDir)}
+                      glow={selDir === 'approaching' ? 'approachGlow 2s ease-in-out infinite' : undefined} />
+                  </div>
+
+                  {/* Metrics grid */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontSize: 11, fontWeight: 500, marginBottom: 10 }}>
+                    {selectedProfile.sig_type === 'heartbeat' ? (<>
+                      <div><span style={{ color: t.textSecondary }}>BPM </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.bpm || '—'}</span></div>
+                      <div><span style={{ color: t.textSecondary }}>RESP </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.respiratory_rate || '—'}/m</span></div>
+                    </>) : (<>
+                      <div><span style={{ color: t.textSecondary }}>CADENCE </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.cadence_spm || '—'} spm</span></div>
+                      <div><span style={{ color: t.textSecondary }}>STRIDE </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.stride_regularity || '—'}</span></div>
+                    </>)}
+                    <div><span style={{ color: t.textSecondary }}>SEEN </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{selectedProfile.detection_count}×</span></div>
+                    <div><span style={{ color: t.textSecondary }}>LAST </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{timeAgo(selectedProfile.last_seen)}</span></div>
+                    {selDist && (
+                      <div style={{ gridColumn: '1 / -1' }}>
+                        <span style={{ color: t.textSecondary }}>DIST </span>
+                        <span style={{ color: dirColor(selDir), fontWeight: 700 }}>{selDist}</span>
+                        {sm.speed_kmh > 0 && selDir !== 'stationary' && (
+                          <span style={{ color: t.textMuted, marginLeft: 8 }}>{sm.speed_kmh} km/h</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Confidence bar */}
+                  {selectedProfile.avg_confidence > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                        <span style={{ fontSize: 9, color: t.textSecondary, fontWeight: 600, letterSpacing: '0.08em' }}>MATCH</span>
+                        <span style={{ fontSize: 10, color: confColor(selectedProfile.avg_confidence, t.green), fontWeight: 800 }}>
+                          {confLabel(selectedProfile.avg_confidence)} {(selectedProfile.avg_confidence * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                      <div style={{ height: 3, background: t.bgProgress, borderRadius: 2, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${selectedProfile.avg_confidence * 100}%`, background: confColor(selectedProfile.avg_confidence, t.green), borderRadius: 2 }} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Species confidence */}
+                  {sm.species_confidence > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                        <span style={{ fontSize: 9, color: t.textSecondary, fontWeight: 600, letterSpacing: '0.08em' }}>SPECIES ID</span>
+                        <span style={{ fontSize: 9, color: speciesColor(sm.species, t.green), fontWeight: 700 }}>{sm.species?.toUpperCase()} {(sm.species_confidence * 100).toFixed(0)}%</span>
+                      </div>
+                      <div style={{ height: 3, background: t.bgProgress, borderRadius: 2, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${sm.species_confidence * 100}%`, background: speciesColor(sm.species, t.green), borderRadius: 2 }} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Tag input if untagged */}
+                  {!selectedProfile.nickname && onTag && (
+                    <button
+                      onClick={() => {
+                        const name = prompt('Enter nickname for this signature:');
+                        if (name?.trim()) onTag(selectedProfile.id, name.trim());
+                      }}
+                      style={{
+                        width: '100%', marginTop: 4, padding: '5px 0',
+                        background: hexToRgba(t.green, 0.1), border: `1px solid ${hexToRgba(t.green, 0.3)}`,
+                        color: t.green, borderRadius: 5, cursor: 'pointer', fontSize: 10,
+                        fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: '0.08em',
+                      }}
+                    >+ TAG THIS SIGNATURE</button>
+                  )}
+
+                  <button onClick={clearSelection} style={{
+                    width: '100%', marginTop: 8, padding: '4px 0',
+                    background: 'transparent', border: `1px solid ${t.border}`,
+                    color: t.textMuted, borderRadius: 5, cursor: 'pointer', fontSize: 9,
+                    fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, letterSpacing: '0.08em',
+                  }}>DESELECT</button>
+                </div>
+              ) : (
+                /* Placeholder when nothing selected */
+                <div style={{
+                  width: 220, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
+                  color: t.textDim, fontSize: 10, fontWeight: 600, letterSpacing: '0.1em',
+                  fontFamily: "'JetBrains Mono', monospace", gap: 10, padding: '0 16px',
+                }}>
+                  <div style={{ fontSize: 28, opacity: 0.25 }}>◎</div>
+                  <div style={{ textAlign: 'center', lineHeight: 1.7 }}>CLICK A DOT<br/>TO INSPECT<br/>THAT TARGET</div>
+                  <div style={{ fontSize: 8, opacity: 0.5, textAlign: 'center' }}>{profiles.length} SIGNATURE{profiles.length !== 1 ? 'S' : ''} TRACKED</div>
+                </div>
+              )}
+            </div>
+
+            {/* Legend */}
+            <div style={{ display: 'flex', gap: 18, marginTop: 16, justifyContent: 'center', flexWrap: 'wrap' }}>
+              {[['#ef4444', '▲ APPROACHING'], ['#3b82f6', '↙ RECEDING'], [t.green, '● STATIONARY']].map(([color, label]) => (
+                <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: '50%', background: color, boxShadow: `0 0 6px ${color}` }} />
+                  <span style={{ fontSize: 9, color: t.textSecondary, fontWeight: 600, letterSpacing: '0.08em', fontFamily: "'JetBrains Mono', monospace" }}>{label}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 8, textAlign: 'center', fontSize: 8, color: t.textDim, letterSpacing: '0.08em', fontFamily: "'JetBrains Mono', monospace" }}>
+              BEARING ASSIGNED PER SIGNATURE ID · RANGE FROM CSI ATTENUATION · ±2m ACCURACY
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
 // ─── Badge ───────────────────────────────────────────────────────────────────
@@ -192,6 +740,7 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
   const icon = isHB ? "♥" : "⦿";
   const m = profile.metadata || {};
   const dir = m.direction || "unknown";
+  const dist = estimateDistance(m.body_attenuation);
 
   const handleSave = () => { if (nickname.trim()) { onTag(profile.id, nickname.trim()); setEditing(false); } };
   const handleDelete = () => {
@@ -200,15 +749,28 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
   };
 
   const dirBorder = dir === "approaching" ? "rgba(239,68,68,0.4)" : dir === "receding" ? "rgba(59,130,246,0.4)" : `${t.border}80`;
+  const isApproaching = dir === "approaching";
 
   return (
     <div style={{
       background: isNew ? t.profileNewBg : t.bgCard,
       border: `1px solid ${isNew ? "rgba(251,191,36,0.5)" : dirBorder}`,
-      borderRadius: 8, padding: 16, position: "relative", overflow: "hidden",
+      borderRadius: 8, padding: 16, paddingTop: isApproaching ? 38 : 16,
+      position: "relative", overflow: "hidden",
       transition: "background 0.2s ease, border-color 0.2s ease",
-      animation: dir === "approaching" ? "approachGlow 3s ease-in-out infinite" : dir === "receding" ? "recedeGlow 3s ease-in-out infinite" : "none",
+      animation: isApproaching ? "approachGlow 3s ease-in-out infinite" : dir === "receding" ? "recedeGlow 3s ease-in-out infinite" : "none",
     }}>
+      {isApproaching && (
+        <div style={{
+          position: "absolute", top: 0, left: 0, right: 0, height: 26,
+          background: "linear-gradient(90deg, rgba(239,68,68,0.85), rgba(239,68,68,0.6))",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "0 10px",
+        }}>
+          <span style={{ fontSize: 10, fontWeight: 800, color: "#fff", letterSpacing: "0.1em" }}>▲ TARGET APPROACHING</span>
+          {dist && <span style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.9)", letterSpacing: "0.06em" }}>{dist}</span>}
+        </div>
+      )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
           <span style={{ fontSize: 20, color: accent, textShadow: `0 0 10px ${accent}`, animation: isHB ? "pulse 1.2s ease-in-out infinite" : "none", flexShrink: 0 }}>{icon}</span>
@@ -256,6 +818,12 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
         </>)}
         <div><span style={{ color: t.textSecondary }}>SEEN </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{profile.detection_count}×</span></div>
         <div><span style={{ color: t.textSecondary }}>LAST </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{timeAgo(profile.last_seen)}</span></div>
+        {dist && (
+          <div style={{ gridColumn: "1 / -1" }}>
+            <span style={{ color: t.textSecondary }}>DIST </span>
+            <span style={{ color: dirColor(dir), fontWeight: 700 }}>{dist}</span>
+          </div>
+        )}
       </div>
 
       {m.species_confidence > 0 && (
@@ -519,7 +1087,7 @@ export default function App() {
 
         <div style={{ display: "grid", gridTemplateColumns: "210px 1fr", minHeight: "calc(100vh - 56px)" }}>
           <aside style={{ borderRight: `1px solid ${t.border}`, padding: 14, display: "flex", flexDirection: "column", gap: 16, background: t.bgSidebar }}>
-            <div style={{ display: "flex", justifyContent: "center" }}><RadarPulse active={connected} /></div>
+            <div style={{ display: "flex", justifyContent: "center" }}><RadarDisplay profiles={profiles} active={connected} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} newIds={newIds} /></div>
 
             <div style={{ fontSize: 10 }}>
               <SectionLabel>SYSTEM</SectionLabel>

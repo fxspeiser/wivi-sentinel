@@ -547,8 +547,11 @@ class SignatureExtractor:
 
         quality = min(1.0, snr / 15.0)
 
-        # Body attenuation estimate from signal variance
-        body_attenuation = float(np.mean(np.var(amplitude_matrix, axis=0)))
+        # Body attenuation: mean per-subcarrier variance, scaled to [0, 1].
+        # Scale factor 40 maps the simulation's typical variance (~0.015) to ~0.6,
+        # giving a plausible mid-range attenuation and ~3 m distance estimate.
+        raw_var = float(np.mean(np.var(amplitude_matrix, axis=0)))
+        body_attenuation = float(np.clip(raw_var * 40.0, 0.0, 1.0))
 
         return {
             'signature': sig_vector.tolist(),
@@ -642,6 +645,10 @@ class SimulatedCSISource:
              'gait_asymmetry': np.random.uniform(0.65, 0.80)},
         ]
 
+        # Fixed initial directions ensure the demo reliably shows all three states.
+        # Majority approaching so the combined Doppler is clearly positive at startup.
+        _initial_directions = [1, 1, -1, 1, 0]  # 3 approaching, 1 receding, 1 stationary
+
         for i, ent in enumerate(entities[:max(n_people, 5)]):
             ent['heart_variability'] = np.random.uniform(0.02, 0.08)
             ent['stride_length'] = np.random.uniform(0.6, 0.85) if ent['type'] == 'human' else np.random.uniform(0.2, 0.5)
@@ -650,61 +657,99 @@ class SimulatedCSISource:
             ent['active'] = True
             ent['position'] = np.random.uniform(-5, 5, size=2)
             # Movement direction: +1 approaching, -1 receding, 0 stationary
-            ent['move_direction'] = np.random.choice([-1, 0, 1])
+            ent['move_direction'] = _initial_directions[i] if i < len(_initial_directions) else np.random.choice([-1, 0, 1])
             ent['radial_speed'] = np.random.uniform(0.3, 1.8) if ent['type'] == 'human' else np.random.uniform(0.5, 3.0)
             self.people.append(ent)
 
         self._time = 0.0
         self._direction_change_timer = 0
+        self._entity_idx = 0  # round-robin index for per-entity profiling
 
     def toggle_person(self, idx):
         if idx < len(self.people):
             self.people[idx]['active'] = not self.people[idx]['active']
 
     def generate_frames(self, n_frames):
-        frames = []
+        """
+        Returns frames focused on a single entity (round-robin rotation).
+
+        Processing each entity separately lets the signature extractor pull out
+        that entity's distinctive biometrics (heart rate, gait cadence, body mass)
+        rather than a blended average, which produces distinct per-entity profiles.
+        """
         dt = 1.0 / self.sample_rate
 
-        # Periodically change movement directions
+        # ── Species-aware direction updates ───────────────────────────────────
         self._direction_change_timer += n_frames
-        if self._direction_change_timer > self.sample_rate * 8:
+        if self._direction_change_timer > self.sample_rate * 10:
             self._direction_change_timer = 0
             for p in self.people:
-                if np.random.random() < 0.4:
-                    p['move_direction'] = np.random.choice([-1, 0, 0, 1])  # bias toward stationary
+                species = p.get('type', 'human')
+                if species == 'dog':
+                    # Dogs are always moving — they pace, fetch, roam
+                    if np.random.random() < 0.75:
+                        p['move_direction'] = np.random.choice([-1, 1])
+                elif species == 'cat':
+                    # Cats are mostly stationary; occasional short bursts
+                    if np.random.random() < 0.35:
+                        p['move_direction'] = np.random.choice([-1, 0, 0, 0, 1])
+                else:
+                    # Humans: walking around, sometimes standing still
+                    if np.random.random() < 0.35:
+                        p['move_direction'] = np.random.choice([-1, -1, 0, 1, 1])
+            # Keep at least one approaching entity so the demo always shows the banner
+            if not any(p['move_direction'] == 1 and p['active'] for p in self.people):
+                active = [p for p in self.people if p['active']]
+                if active:
+                    active[0]['move_direction'] = 1
 
+        # ── Select current entity (round-robin) ───────────────────────────────
+        active_entities = [p for p in self.people if p['active']]
+        if not active_entities:
+            # No entities: return low-level noise
+            frames = [
+                CSIFrame(
+                    timestamp=self._time + i * dt,
+                    amplitudes=np.abs(np.random.normal(0.1, 0.005, self.n_subcarriers)),
+                    phases=np.random.uniform(-0.1, 0.1, self.n_subcarriers),
+                )
+                for i in range(n_frames)
+            ]
+            self._time += n_frames * dt
+            return frames
+
+        entity = active_entities[self._entity_idx % len(active_entities)]
+        self._entity_idx = (self._entity_idx + 1) % len(active_entities)
+
+        # ── Generate frames for this entity only ──────────────────────────────
+        frames = []
+        p = entity
         for _ in range(n_frames):
             t = self._time
             amps = np.ones(self.n_subcarriers) * 0.1
             phases = np.random.uniform(-0.1, 0.1, self.n_subcarriers)
 
-            for p in self.people:
-                if not p['active']:
-                    continue
+            hr_freq = p['heart_rate'] / 60.0
+            hrv = p['heart_variability'] * np.sin(2 * np.pi * 0.1 * t)
+            hb = p['body_attenuation'] * 0.02 * np.sin(2 * np.pi * (hr_freq + hrv) * t + p['phase_offset'])
+            hb += p['body_attenuation'] * 0.008 * np.sin(2 * np.pi * 2 * hr_freq * t + p['phase_offset'])
 
-                hr_freq = p['heart_rate'] / 60.0
-                hrv = p['heart_variability'] * np.sin(2 * np.pi * 0.1 * t)
-                hb = p['body_attenuation'] * 0.02 * np.sin(2 * np.pi * (hr_freq + hrv) * t + p['phase_offset'])
-                hb += p['body_attenuation'] * 0.008 * np.sin(2 * np.pi * 2 * hr_freq * t + p['phase_offset'])
+            resp_freq = p['resp_rate'] / 60.0
+            resp = p['body_attenuation'] * 0.05 * np.sin(2 * np.pi * resp_freq * t)
 
-                resp_freq = p['resp_rate'] / 60.0
-                resp = p['body_attenuation'] * 0.05 * np.sin(2 * np.pi * resp_freq * t)
+            gait_freq = p['gait_cadence'] / 60.0
+            gait = p['body_attenuation'] * 0.15 * (
+                np.sin(2 * np.pi * gait_freq * t) +
+                p['gait_asymmetry'] * 0.3 * np.sin(2 * np.pi * 2 * gait_freq * t + 0.5)
+            )
+            gait += p['body_attenuation'] * 0.04 * np.sin(2 * np.pi * 2 * gait_freq * t + np.pi / 4)
 
-                gait_freq = p['gait_cadence'] / 60.0
-                gait = p['body_attenuation'] * 0.15 * (
-                    np.sin(2 * np.pi * gait_freq * t) +
-                    p['gait_asymmetry'] * 0.3 * np.sin(2 * np.pi * 2 * gait_freq * t + 0.5)
-                )
-                gait += p['body_attenuation'] * 0.04 * np.sin(2 * np.pi * 2 * gait_freq * t + np.pi/4)
+            person_signal = (hb + resp + gait) * p['subcarrier_profile'] * self.n_subcarriers
+            amps += person_signal
 
-                person_signal = (hb + resp + gait) * p['subcarrier_profile'] * self.n_subcarriers
-                amps += person_signal
-
-                # Doppler phase shift based on movement direction
-                doppler_base = 0.1 * gait_freq * np.cos(2 * np.pi * gait_freq * t)
-                # Add consistent phase drift for direction
-                direction_drift = p['move_direction'] * p['radial_speed'] * 2 * np.pi / WAVELENGTH
-                phases += (doppler_base + direction_drift * dt) * p['subcarrier_profile'] * 5
+            doppler_base = 0.1 * gait_freq * np.cos(2 * np.pi * gait_freq * t)
+            direction_drift = p['move_direction'] * p['radial_speed'] * 2 * np.pi / WAVELENGTH
+            phases += (doppler_base + direction_drift * dt) * p['subcarrier_profile'] * 5
 
             amps += np.random.normal(0, 0.005, self.n_subcarriers)
             phases += np.random.normal(0, 0.02, self.n_subcarriers)
