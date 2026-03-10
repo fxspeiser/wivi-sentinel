@@ -389,6 +389,8 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) 
   const t = useContext(ThemeContext);
   const [expanded, setExpanded] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
+  const [editingTag, setEditingTag] = useState(false);
+  const [tagInput, setTagInput] = useState('');
   const sweepAngle = useRef(0);
   const pingTimes = useRef({});
   // Ref so the canvas draw loop can read selection without restarting the animation
@@ -400,8 +402,8 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) 
   const lastPosTs = useRef(null);
   const posUpdateRef = useRef(null);
 
-  const selectProfile = (id) => { selectedIdRef.current = id; setSelectedId(id); };
-  const clearSelection = () => { selectedIdRef.current = null; setSelectedId(null); };
+  const selectProfile = (id) => { selectedIdRef.current = id; setSelectedId(id); setEditingTag(false); };
+  const clearSelection = () => { selectedIdRef.current = null; setSelectedId(null); setEditingTag(false); };
 
   const EXPANDED_SIZE = 400;
 
@@ -585,9 +587,41 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) 
 
                   {/* Name + type */}
                   <div style={{ marginBottom: 10 }}>
-                    <div style={{ fontSize: 14, fontWeight: 800, color: t.textPrimary, letterSpacing: '0.02em' }}>
-                      {selectedProfile.nickname || 'UNTAGGED'}
-                    </div>
+                    {editingTag ? (
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <input
+                          value={tagInput}
+                          onChange={e => setTagInput(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' && tagInput.trim()) { onTag(selectedProfile.id, tagInput.trim()); setEditingTag(false); }
+                            if (e.key === 'Escape') setEditingTag(false);
+                          }}
+                          placeholder="Enter nickname..."
+                          autoFocus
+                          style={{
+                            background: t.bgInput, border: `1px solid ${t.green}`, borderRadius: 4,
+                            color: t.textPrimary, padding: '4px 8px', fontSize: 13, flex: 1,
+                            fontFamily: "'JetBrains Mono', monospace", outline: 'none',
+                          }}
+                        />
+                        <button
+                          onClick={() => { if (tagInput.trim()) { onTag(selectedProfile.id, tagInput.trim()); setEditingTag(false); } }}
+                          style={{
+                            background: hexToRgba(t.green, 0.13), border: `1px solid ${t.green}`,
+                            color: t.green, borderRadius: 4, padding: '3px 10px', cursor: 'pointer',
+                            fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700,
+                          }}
+                        >OK</button>
+                      </div>
+                    ) : (
+                      <div
+                        onClick={() => { setTagInput(selectedProfile.nickname || ''); setEditingTag(true); }}
+                        style={{ fontSize: 14, fontWeight: 800, color: selectedProfile.nickname ? t.textPrimary : t.textSecondary, letterSpacing: '0.02em', cursor: 'pointer' }}
+                        title="Click to edit tag"
+                      >
+                        {selectedProfile.nickname || 'UNTAGGED — click to name'}
+                      </div>
+                    )}
                     <div style={{ fontSize: 10, color: t.textSecondary, marginTop: 2, letterSpacing: '0.06em' }}>
                       {selectedProfile.sig_type.toUpperCase()} · {selectedProfile.id.slice(0, 10)}
                     </div>
@@ -653,13 +687,10 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) 
                     </div>
                   )}
 
-                  {/* Tag input if untagged */}
-                  {!selectedProfile.nickname && onTag && (
+                  {/* Tag button — opens inline editor */}
+                  {!selectedProfile.nickname && onTag && !editingTag && (
                     <button
-                      onClick={() => {
-                        const name = prompt('Enter nickname for this signature:');
-                        if (name?.trim()) onTag(selectedProfile.id, name.trim());
-                      }}
+                      onClick={() => { setTagInput(''); setEditingTag(true); }}
                       style={{
                         width: '100%', marginTop: 4, padding: '5px 0',
                         background: hexToRgba(t.green, 0.1), border: `1px solid ${hexToRgba(t.green, 0.3)}`,

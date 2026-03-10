@@ -659,6 +659,7 @@ class SimulatedCSISource:
             # Movement direction: +1 approaching, -1 receding, 0 stationary
             ent['move_direction'] = _initial_directions[i] if i < len(_initial_directions) else np.random.choice([-1, 0, 1])
             ent['radial_speed'] = np.random.uniform(0.3, 1.8) if ent['type'] == 'human' else np.random.uniform(0.5, 3.0)
+            ent['accumulated_phase'] = np.zeros(N_SUBCARRIERS)  # persistent phase for Doppler
             self.people.append(ent)
 
         self._time = 0.0
@@ -727,7 +728,6 @@ class SimulatedCSISource:
         for _ in range(n_frames):
             t = self._time
             amps = np.ones(self.n_subcarriers) * 0.1
-            phases = np.random.uniform(-0.1, 0.1, self.n_subcarriers)
 
             hr_freq = p['heart_rate'] / 60.0
             hrv = p['heart_variability'] * np.sin(2 * np.pi * 0.1 * t)
@@ -747,12 +747,13 @@ class SimulatedCSISource:
             person_signal = (hb + resp + gait) * p['subcarrier_profile'] * self.n_subcarriers
             amps += person_signal
 
+            # Accumulate Doppler phase shift so detect_direction sees a consistent trend
             doppler_base = 0.1 * gait_freq * np.cos(2 * np.pi * gait_freq * t)
             direction_drift = p['move_direction'] * p['radial_speed'] * 2 * np.pi / WAVELENGTH
-            phases += (doppler_base + direction_drift * dt) * p['subcarrier_profile'] * 5
+            p['accumulated_phase'] += (doppler_base + direction_drift * dt) * p['subcarrier_profile'] * 5
+            phases = p['accumulated_phase'] + np.random.normal(0, 0.02, self.n_subcarriers)
 
             amps += np.random.normal(0, 0.005, self.n_subcarriers)
-            phases += np.random.normal(0, 0.02, self.n_subcarriers)
 
             frames.append(CSIFrame(timestamp=t, amplitudes=np.abs(amps), phases=phases))
             self._time += dt
