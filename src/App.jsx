@@ -1154,6 +1154,7 @@ export default function App() {
       last_seen:  (a, b) => new Date(b.last_seen) - new Date(a.last_seen),
       confidence: (a, b) => (b.avg_confidence || 0) - (a.avg_confidence || 0),
       detections: (a, b) => b.detection_count - a.detection_count,
+      distance:   (a, b) => (b.metadata?.body_attenuation || 0) - (a.metadata?.body_attenuation || 0),
       species:    (a, b) => (a.metadata?.species || "").localeCompare(b.metadata?.species || ""),
       direction:  (a, b) => { const ord = { approaching: 0, receding: 1, stationary: 2 }; return (ord[a.metadata?.direction] ?? 3) - (ord[b.metadata?.direction] ?? 3); },
       sex:        (a, b) => (a.metadata?.sex_estimation || "").localeCompare(b.metadata?.sex_estimation || ""),
@@ -1256,7 +1257,7 @@ export default function App() {
 
             <div>
               <SectionLabel>SORT BY</SectionLabel>
-              {[["last_seen", "LAST SEEN"], ["confidence", "CONFIDENCE"], ["detections", "DETECTIONS"], ["species", "SPECIES"], ["direction", "DIRECTION"], ["sex", "SEX"]].map(([k, l]) => (
+              {[["last_seen", "LAST SEEN"], ["distance", "DISTANCE"], ["confidence", "CONFIDENCE"], ["detections", "DETECTIONS"], ["species", "SPECIES"], ["direction", "DIRECTION"], ["sex", "SEX"]].map(([k, l]) => (
                 <button key={k} onClick={() => setSortBy(k)} style={{
                   display: "block", width: "100%", textAlign: "left", padding: "4px 8px", marginBottom: 1,
                   background: sortBy === k ? hexToRgba(t.green, 0.07) : "transparent",

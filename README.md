@@ -41,14 +41,16 @@ dashboard.
 
 - **ESP32-DevKitC-32E** — CSI capture device (~$10)
 - **Raspberry Pi 4 Model B** (any RAM variant) — runs the server
-- **USB-A to Micro-USB cable** — connects ESP32 to Pi
+- **USB-A to Micro-USB data cable** — connects ESP32 to Pi (must be a data cable, not charge-only)
 - **Micro SD card** (16 GB+) for the Pi
 - **USB-C power supply** for the Pi
+- **Ethernet cable** (recommended) — for reliable Pi network connectivity
 - **Your existing router** — must broadcast on **2.4 GHz** (ESP32 is 2.4 GHz only)
 
-> **Note:** The Pi does **not** need an Ethernet connection. The ESP32 handles
-> CSI capture over USB, leaving the Pi's WiFi free for network connectivity
-> and serving the dashboard.
+> **Note:** The Pi's WiFi is free since the ESP32 handles CSI capture over USB.
+> However, some routers (e.g. Spectrum) may not issue DHCP leases over WiFi
+> reliably. If the Pi can't get a WiFi IP, use **Ethernet** for connectivity.
+> An Ethernet cable is recommended for the most reliable setup.
 
 ---
 
@@ -84,7 +86,7 @@ Flash **Raspberry Pi OS Lite** with Raspberry Pi Imager. In settings:
 - Set username/password
 - Configure WiFi
 
-Boot the Pi that, SSH in, and install dependencies:
+Boot the Pi, SSH in, and install dependencies:
 
 ```bash
 ssh pi@raspberrypi.local
@@ -93,19 +95,34 @@ sudo apt update && sudo apt install python3 python3-pip python3-venv
 
 ### 3. Deploy Wi-Vi Sentinel to the Pi
 
-From your Mac, copy the project files:
+Clone the repo on the Pi (or copy from your Mac):
 
 ```bash
+# Option A: clone directly on the Pi
+ssh pi@raspberrypi.local
+git clone https://github.com/YOUR_USER/wivi-sentinel.git ~/wivi-sentinel
+
+# Option B: copy from your Mac
 scp -r . pi@raspberrypi.local:~/wivi-sentinel/
 ```
 
-On the Pi:
+On the Pi, install Python dependencies:
 
 ```bash
 cd ~/wivi-sentinel
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Build and deploy the dashboard (on your Mac, since the Pi may not have Node):
+
+```bash
+npm install && npm run build
+scp -r dist pi@raspberrypi.local:~/wivi-sentinel/
+```
+
+> **Note:** `dist/` is gitignored, so after `git pull` on the Pi you'll need to
+> re-scp the `dist/` folder or build it locally with `npm run build`.
 
 ### 4. Connect the ESP32
 
@@ -355,22 +372,26 @@ PROBE_IFACE=wlan0mon
 wivi-sentinel/
 ├── server.py               # Flask API server + detection loop
 ├── engine/
+│   ├── __init__.py
 │   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore
+│   ├── csi_collector.py    # CSI frame collection utilities
 │   ├── esp32_source.py     # ESP32 CSI source (USB serial)
 │   ├── nexmon_source.py    # Nexmon CSI source (UDP, legacy)
 │   └── device_scanner.py   # mDNS + probe request device discovery
+├── nexmon_source.py        # Nexmon source (root-level, legacy)
+├── csi_extractor.py        # Pi-side CSI capture for Nexmon (legacy)
 ├── setup_esp32.sh          # ESP32 firmware setup script
 ├── setup_pi.sh             # Pi setup script (Nexmon, legacy)
-├── csi_extractor.py        # Pi-side CSI capture for Nexmon (legacy)
 ├── src/                    # Vite/React dashboard source
 │   ├── main.jsx
-│   ├── App.jsx
+│   ├── App.jsx             # Dashboard UI (cards, compact view, radar)
 │   └── index.css
+├── dist/                   # Vite build output (gitignored, scp to Pi)
 ├── index.html              # Vite entry point
 ├── index.legacy.html       # CDN Babel fallback (no build required)
 ├── vite.config.js
 ├── package.json
-├── requirements.txt
+├── requirements.txt        # Python deps (flask, numpy, scipy, pyserial, etc.)
 ├── .env.example            # Reference config (copy to .env locally)
 └── data/
     └── profiles.json       # Biometric profiles (gitignored)

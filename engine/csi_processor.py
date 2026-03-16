@@ -128,10 +128,13 @@ SEX_FEATURES = {
 
 class CSIFrame:
     """Single CSI measurement frame across all subcarriers."""
-    def __init__(self, timestamp: float, amplitudes: np.ndarray, phases: np.ndarray):
+    def __init__(self, timestamp: float, amplitudes: np.ndarray, phases: np.ndarray,
+                 rssi: float = 0.0, raw_amplitude: float = 0.0):
         self.timestamp = timestamp
         self.amplitudes = amplitudes  # shape: (N_SUBCARRIERS,)
         self.phases = phases          # shape: (N_SUBCARRIERS,)
+        self.rssi = rssi              # dBm from CSI_DATA header
+        self.raw_amplitude = raw_amplitude  # pre-normalization max amplitude
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -469,11 +472,16 @@ class SignatureExtractor:
         quality = min(1.0, snr / 20.0)
         resp_rate = self._estimate_resp_rate(respiratory)
 
+        # Body attenuation (same formula as gait extraction)
+        raw_var = float(np.mean(np.var(amplitude_matrix, axis=0)))
+        body_attenuation = float(np.clip((np.log10(raw_var + 1e-6) + 4.0) / 1.0, 0.0, 1.0))
+
         return {
             'signature': sig_vector.tolist(),
             'bpm': round(float(bpm), 1),
             'signal_quality': round(float(quality), 3),
             'respiratory_rate': round(float(resp_rate), 1),
+            'body_attenuation': round(float(body_attenuation), 4),
         }
 
     def _estimate_resp_rate(self, respiratory_signal: np.ndarray) -> float:
@@ -558,12 +566,11 @@ class SignatureExtractor:
         quality = min(1.0, snr / 15.0)
 
         # Body attenuation: proxy for distance.  Higher CSI variance ⇒ closer body.
-        # ESP32 normalises amplitudes to [0,1] per frame so variance is typically
-        # 0.01–0.10; simulated data sits around 0.01–0.03.  We use a log scale
-        # so both regimes map into a useful [0,1] range.
+        # ESP32 normalises amplitudes to [0,1] per frame so inter-frame variance
+        # is very small (~0.0001–0.001).  Log scale maps this to [0, 1].
         raw_var = float(np.mean(np.var(amplitude_matrix, axis=0)))
-        # log-scale: var=0.002 → ~0.15, var=0.02 → ~0.5, var=0.15 → ~0.95
-        body_attenuation = float(np.clip((np.log10(raw_var + 1e-6) + 2.7) / 2.0, 0.0, 1.0))
+        # log-scale: var=0.0001→~0.0, var=0.0002→~0.3, var=0.0004→~0.6, var=0.001→~1.0
+        body_attenuation = float(np.clip((np.log10(raw_var + 1e-6) + 4.0) / 1.0, 0.0, 1.0))
 
         return {
             'signature': sig_vector.tolist(),

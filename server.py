@@ -139,6 +139,11 @@ def detection_loop():
             hb_result = extractor.extract_heartbeat_signature(amp_matrix)
             gait_result = extractor.extract_gait_signature(amp_matrix)
 
+            _attn = gait_result.get('body_attenuation', 0)
+            _dist = round(max(0.5, (1.0 - _attn) * 8.0 + 0.5), 1) if _attn > 0 else None
+            _raw_var = float(np.mean(np.var(amp_matrix, axis=0)))
+            print(f"[DBG] var={_raw_var:.6f}  attn={_attn:.3f}  dist={_dist}  bpm={hb_result['bpm']:.0f}  cadence={gait_result['cadence_spm']:.0f}")
+
             # ── Direction detection ──
             direction_result = direction_detector.detect_direction(phase_matrix, amp_matrix)
 
@@ -194,10 +199,14 @@ def detection_loop():
                         best_match = s
 
                 threshold = config['match_threshold']
+                hb_attn = hb_result.get('body_attenuation', 0)
+                hb_distance = round(max(0.5, (1.0 - hb_attn) * 8.0 + 0.5), 1) if hb_attn > 0 else None
                 metadata = {
                     'bpm': hb_result['bpm'],
                     'signal_quality': hb_result['signal_quality'],
                     'respiratory_rate': hb_result['respiratory_rate'],
+                    'body_attenuation': hb_attn,
+                    'distance_m': hb_distance,
                     **classification,
                 }
 

@@ -167,11 +167,22 @@ class ESP32CSISource:
             - Plus 1 boundary pair on each side of the null gap
         """
         try:
-            # Find the bracketed data array within the CSV line
+            # Extract RSSI from the CSV fields before the bracketed data
+            # Format: CSI_DATA,mac,mac,rssi,rate,...,[data]
             bracket_start = line.find('[')
             bracket_end = line.rfind(']')
             if bracket_start < 0 or bracket_end < 0:
                 return None
+
+            # Parse CSV fields before the bracket to get RSSI
+            prefix = line[:bracket_start]
+            fields = [f.strip() for f in prefix.split(',')]
+            rssi = 0.0
+            if len(fields) >= 4:
+                try:
+                    rssi = float(fields[3])  # RSSI is 4th field (index 3)
+                except (ValueError, IndexError):
+                    pass
 
             data_str = line[bracket_start + 1:bracket_end]
             values = [int(x) for x in data_str.split(',')]
@@ -204,6 +215,9 @@ class ESP32CSISource:
                 amplitudes = amplitudes[indices]
                 phases = phases[indices]
 
+            # Store raw amplitude before normalization
+            raw_amplitude = float(amplitudes.max())
+
             # Normalize amplitudes to roughly [0, 1] range
             amp_max = amplitudes.max()
             if amp_max > 0:
@@ -213,6 +227,8 @@ class ESP32CSISource:
                 timestamp=time.time(),
                 amplitudes=amplitudes,
                 phases=phases,
+                rssi=rssi,
+                raw_amplitude=raw_amplitude,
             )
 
         except (ValueError, IndexError) as e:
