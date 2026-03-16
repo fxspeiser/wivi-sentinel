@@ -70,10 +70,12 @@ const timeAgo = (iso) => {
 };
 
 // Rough distance estimate from body_attenuation (0–1, higher = more signal blocked = closer).
-// Based on indoor WiFi path-loss model; accuracy ±2 m.
-const estimateDistance = (attenuation) => {
-  if (attenuation == null || attenuation <= 0) return null;
-  const d = Math.max(0.5, (1.0 - attenuation) * 8.0 + 0.5);
+// Prefers server-computed distance_m when available.
+const estimateDistance = (attenuation, distance_m) => {
+  const d = distance_m != null ? distance_m
+    : (attenuation != null && attenuation > 0) ? Math.max(0.5, (1.0 - attenuation) * 8.0 + 0.5)
+    : null;
+  if (d == null) return null;
   return d < 10 ? `~${d.toFixed(1)} m` : `~${Math.round(d)} m`;
 };
 
@@ -172,7 +174,8 @@ function RadarCanvas({ size, profiles, active, sweepAngle, pingTimes, selectedId
       } else {
         angle = angleMap.get(p.id) ?? 0;
         const attn = m.body_attenuation || 0;
-        dist = attn > 0 ? Math.max(0.5, (1.0 - attn) * 8.0 + 0.5) : null;
+        dist = m.distance_m != null ? m.distance_m
+             : attn > 0 ? Math.max(0.5, (1.0 - attn) * 8.0 + 0.5) : null;
         r = dist ? Math.min(maxR - dotR - 2, (dist / maxDist) * maxR) : maxR * 0.72;
       }
       return {
@@ -497,7 +500,7 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) 
   const selectedProfile = profiles.find(p => p.id === selectedId);
   const sm = selectedProfile?.metadata || {};
   const selDir = sm.direction || 'unknown';
-  const selDist = estimateDistance(sm.body_attenuation);
+  const selDist = estimateDistance(sm.body_attenuation, sm.distance_m);
 
   return (
     <>
@@ -771,7 +774,7 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
   const icon = isHB ? "♥" : "⦿";
   const m = profile.metadata || {};
   const dir = m.direction || "unknown";
-  const dist = estimateDistance(m.body_attenuation);
+  const dist = estimateDistance(m.body_attenuation, m.distance_m);
 
   const handleSave = () => { if (nickname.trim()) { onTag(profile.id, nickname.trim()); setEditing(false); } };
   const handleDelete = () => {
@@ -990,7 +993,7 @@ function CompactRow({ profile, onTag }) {
   const icon = isHB ? "♥" : "⦿";
   const m = profile.metadata || {};
   const dir = m.direction || "unknown";
-  const dist = estimateDistance(m.body_attenuation);
+  const dist = estimateDistance(m.body_attenuation, m.distance_m);
   const lastSeen = profile.last_seen;
   const isApproaching = dir === "approaching";
 

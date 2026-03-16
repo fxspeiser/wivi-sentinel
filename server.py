@@ -230,12 +230,16 @@ def detection_loop():
                         best_match = s
 
                 threshold = config['match_threshold']
+                attn = gait_result.get('body_attenuation', 0)
+                # Distance estimate: body_attenuation ~1 ⇒ very close, ~0 ⇒ far
+                distance_m = round(max(0.5, (1.0 - attn) * 8.0 + 0.5), 1) if attn > 0 else None
                 metadata = {
                     'cadence_spm': gait_result['cadence_spm'],
                     'stride_regularity': gait_result['stride_regularity'],
                     'signal_quality': gait_result['signal_quality'],
                     'harmonic_ratio': gait_result.get('harmonic_ratio', 0),
-                    'body_attenuation': gait_result.get('body_attenuation', 0),
+                    'body_attenuation': attn,
+                    'distance_m': distance_m,
                     **classification,
                 }
 

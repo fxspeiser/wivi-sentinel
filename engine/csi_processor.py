@@ -51,10 +51,20 @@ MATCH_THRESHOLD = 0.72        # cosine similarity threshold for positive ID
 HIGH_CONFIDENCE = 0.85
 DTW_MAX_WARP = 15             # DTW warping constraint
 
-# Carrier frequency for Doppler calculation (WiFi 5GHz channel 36)
-CARRIER_FREQ_HZ = 5.18e9
+# Carrier frequency for Doppler calculation
+# ESP32 uses 2.4 GHz (channel 11 = 2462 MHz); Pi Nexmon typically uses 5 GHz
 SPEED_OF_LIGHT = 3e8
-WAVELENGTH = SPEED_OF_LIGHT / CARRIER_FREQ_HZ  # ~0.058m
+_FREQ_2_4GHZ = 2.462e9   # channel 11
+_FREQ_5GHZ = 5.18e9      # channel 36
+
+def _get_carrier_freq():
+    """Pick carrier frequency based on CSI_SOURCE env var."""
+    import os
+    src = os.environ.get('CSI_SOURCE', 'simulated').lower()
+    return _FREQ_2_4GHZ if src == 'esp32' else _FREQ_5GHZ
+
+CARRIER_FREQ_HZ = _get_carrier_freq()
+WAVELENGTH = SPEED_OF_LIGHT / CARRIER_FREQ_HZ
 
 # ─── Species Classification Thresholds ───────────────────────────────────────
 # Based on comparative physiology:
@@ -547,11 +557,13 @@ class SignatureExtractor:
 
         quality = min(1.0, snr / 15.0)
 
-        # Body attenuation: mean per-subcarrier variance, scaled to [0, 1].
-        # Scale factor 40 maps the simulation's typical variance (~0.015) to ~0.6,
-        # giving a plausible mid-range attenuation and ~3 m distance estimate.
+        # Body attenuation: proxy for distance.  Higher CSI variance ⇒ closer body.
+        # ESP32 normalises amplitudes to [0,1] per frame so variance is typically
+        # 0.01–0.10; simulated data sits around 0.01–0.03.  We use a log scale
+        # so both regimes map into a useful [0,1] range.
         raw_var = float(np.mean(np.var(amplitude_matrix, axis=0)))
-        body_attenuation = float(np.clip(raw_var * 40.0, 0.0, 1.0))
+        # log-scale: var=0.002 → ~0.15, var=0.02 → ~0.5, var=0.15 → ~0.95
+        body_attenuation = float(np.clip((np.log10(raw_var + 1e-6) + 2.7) / 2.0, 0.0, 1.0))
 
         return {
             'signature': sig_vector.tolist(),
