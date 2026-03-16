@@ -112,8 +112,8 @@ static esp_err_t wifi_init_sta(void)
     ESP_LOGI(TAG, "WiFi SSID: %s (source: %s)", ssid, from_nvs ? "NVS/dashboard" : "firmware default");
 
     wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+    memcpy(wifi_config.sta.ssid, ssid, strlen(ssid));
+    memcpy(wifi_config.sta.password, password, strlen(password));
     wifi_config.sta.threshold.authmode = strlen(password) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -151,9 +151,9 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
     static int s_count = 0;
     float compensate_gain = 1.0f;
+#if CONFIG_GAIN_CONTROL
     static uint8_t agc_gain = 0;
     static int8_t fft_gain = 0;
-#if CONFIG_GAIN_CONTROL
     static uint8_t agc_gain_baseline = 0;
     static int8_t fft_gain_baseline = 0;
     esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);

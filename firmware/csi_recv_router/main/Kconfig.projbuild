@@ -1,0 +1,16 @@
+menu "Wi-Vi Sentinel Configuration"
+
+    config EXAMPLE_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            WiFi network name (2.4 GHz). Can be overridden at runtime
+            via the dashboard's WiFi settings (stored in NVS).
+
+    config EXAMPLE_WIFI_PASSWORD
+        string "WiFi Password"
+        default ""
+        help
+            WiFi password. Can be overridden at runtime via the dashboard.
+
+endmenu

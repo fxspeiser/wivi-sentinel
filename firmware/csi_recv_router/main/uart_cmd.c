@@ -7,6 +7,7 @@
  */
 
 #include "uart_cmd.h"
+#include "wifi_nvs.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -16,8 +17,6 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "esp_netif.h"
 
 static const char *TAG = "uart_cmd";
@@ -26,41 +25,6 @@ static const char *TAG = "uart_cmd";
 #define UART_BUF_SIZE  512
 #define CMD_PREFIX     "CMD:"
 #define RESP_PREFIX    "RESP:"
-#define NVS_NAMESPACE  "wivi_wifi"
-#define NVS_KEY_SSID   "ssid"
-#define NVS_KEY_PASS   "password"
-
-/* ── NVS helpers ─────────────────────────────────────────────────────────── */
-
-static esp_err_t nvs_save_wifi(const char *ssid, const char *password)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-
-    err = nvs_set_str(handle, NVS_KEY_SSID, ssid);
-    if (err == ESP_OK)
-        err = nvs_set_str(handle, NVS_KEY_PASS, password);
-    if (err == ESP_OK)
-        err = nvs_commit(handle);
-
-    nvs_close(handle);
-    return err;
-}
-
-esp_err_t nvs_load_wifi(char *ssid, size_t ssid_len, char *password, size_t pass_len)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) return err;
-
-    err = nvs_get_str(handle, NVS_KEY_SSID, ssid, &ssid_len);
-    if (err == ESP_OK)
-        err = nvs_get_str(handle, NVS_KEY_PASS, password, &pass_len);
-
-    nvs_close(handle);
-    return err;
-}
 
 /* ── Command handlers ────────────────────────────────────────────────────── */
 
@@ -82,10 +46,15 @@ static void handle_wifi_set(const char *payload)
         return;
     }
 
-    strncpy(ssid, payload, ssid_len);
-    strncpy(pass, sep + 1, sizeof(pass) - 1);
+    memcpy(ssid, payload, ssid_len);
+    ssid[ssid_len] = '\0';
 
-    esp_err_t err = nvs_save_wifi(ssid, pass);
+    size_t pass_len = strlen(sep + 1);
+    if (pass_len > 64) pass_len = 64;
+    memcpy(pass, sep + 1, pass_len);
+    pass[pass_len] = '\0';
+
+    esp_err_t err = wifi_nvs_save(ssid, pass);
     if (err != ESP_OK) {
         printf(RESP_PREFIX "ERR:NVS write failed (%s)\n", esp_err_to_name(err));
         return;

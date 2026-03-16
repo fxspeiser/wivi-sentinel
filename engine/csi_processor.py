@@ -47,7 +47,7 @@ WINDOW_SIZE = 512             # samples per analysis window
 HOP_SIZE = 64                 # overlap hop
 N_SUBCARRIERS = 56            # 802.11n 20MHz
 SIGNATURE_LENGTH = 128        # compressed signature vector length
-MATCH_THRESHOLD = 0.72        # cosine similarity threshold for positive ID
+MATCH_THRESHOLD = 0.60        # cosine similarity threshold for positive ID
 HIGH_CONFIDENCE = 0.85
 DTW_MAX_WARP = 15             # DTW warping constraint
 
@@ -917,7 +917,7 @@ class DeviceCorrelator:
     # Confidence threshold to auto-confirm a suggested device→subject association
     AUTO_CONFIRM_THRESHOLD = 0.82
     # Minimum co-presence observations before auto-tag fires (avoids early false positives)
-    AUTO_TAG_MIN_SIGHTINGS = 10
+    AUTO_TAG_MIN_SIGHTINGS = 30
 
     def __init__(self, profile_store: 'ProfileStore'):
         self._store = profile_store
@@ -939,6 +939,13 @@ class DeviceCorrelator:
         visible_devices: dict returned by DeviceScanner.get_visible()
         """
         with self._lock:
+            self._total_windows = getattr(self, '_total_windows', 0) + 1
+            # Track how many windows each device is visible in (for ambient detection)
+            if not hasattr(self, '_device_window_counts'):
+                self._device_window_counts = defaultdict(int)
+            for dev_key in visible_devices:
+                self._device_window_counts[dev_key] += 1
+
             for pid in profile_ids:
                 self._detection_counts[pid] += 1
                 for dev_key in visible_devices:
@@ -957,12 +964,28 @@ class DeviceCorrelator:
                     f"profile {profile_id} → '{device_display_name}'"
                 )
 
+    def _selectivity(self, dev_key):
+        """
+        Returns a 0–1 factor: 1.0 for a device only seen with one profile,
+        close to 0 for a device seen in every single window (ambient/stationary).
+        """
+        total_windows = getattr(self, '_total_windows', 1)
+        dev_windows = getattr(self, '_device_window_counts', {}).get(dev_key, 0)
+        if total_windows == 0:
+            return 1.0
+        # Fraction of windows where this device was visible
+        ubiquity = dev_windows / total_windows
+        # Penalize devices visible >80% of the time (ambient)
+        if ubiquity > 0.8:
+            return max(0.1, 1.0 - ubiquity)
+        return 1.0
+
     def get_candidates(self, profile_id: str, visible_devices: dict) -> list:
         """
         Returns ranked device candidates for a profile:
           [{'display_name', 'device_key', 'score', 'sightings', 'suggested'}, ...]
 
-        Score = co-presence fraction (0–1). Suggested entries sort first.
+        Score = co-presence fraction * selectivity. Suggested entries sort first.
         """
         with self._lock:
             total = self._detection_counts.get(profile_id, 0)
@@ -974,10 +997,12 @@ class DeviceCorrelator:
                 dev_info = visible_devices.get(dev_key, {})
                 display_name = dev_info.get('display_name', dev_key)
                 suggested = display_name in self._suggestions.get(profile_id, [])
+                raw_score = count / total
+                score = raw_score * self._selectivity(dev_key)
                 results.append({
                     'display_name': display_name,
                     'device_key': dev_key,
-                    'score': round(count / total, 3),
+                    'score': round(score, 3),
                     'sightings': count,
                     'suggested': suggested,
                 })
@@ -1007,7 +1032,7 @@ class DeviceCorrelator:
                     for dev_key, count in self._co_presence.get(pid, {}).items():
                         dev_info = visible_devices.get(dev_key, {})
                         if dev_info.get('display_name', '') == display_name:
-                            score = count / total
+                            score = (count / total) * self._selectivity(dev_key)
                             if score >= self.AUTO_CONFIRM_THRESHOLD:
                                 to_tag.append((pid, display_name, round(score, 3)))
                                 self._confirmed.add(pair)
