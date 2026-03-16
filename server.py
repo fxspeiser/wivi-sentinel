@@ -462,6 +462,35 @@ def suggest_device():
     })
 
 
+# ─── ESP32 WiFi Configuration ────────────────────────────────────────────────
+
+@app.route('/api/esp32/wifi', methods=['POST'])
+def esp32_wifi_set():
+    """Set WiFi credentials on the ESP32 via serial command."""
+    if CSI_MODE != 'esp32':
+        return jsonify({'error': 'ESP32 source not active'}), 400
+
+    data = request.json or {}
+    ssid = data.get('ssid', '').strip()
+    password = data.get('password', '')
+
+    if not ssid:
+        return jsonify({'error': 'SSID is required'}), 400
+
+    result = csi_source.set_wifi_credentials(ssid, password)
+    return jsonify(result), 200 if result['success'] else 500
+
+
+@app.route('/api/esp32/wifi', methods=['GET'])
+def esp32_wifi_status():
+    """Get current WiFi connection status from the ESP32."""
+    if CSI_MODE != 'esp32':
+        return jsonify({'error': 'ESP32 source not active'}), 400
+
+    result = csi_source.get_wifi_status()
+    return jsonify(result)
+
+
 # ─── Startup ─────────────────────────────────────────────────────────────────
 
 detector_thread = threading.Thread(target=detection_loop, daemon=True)

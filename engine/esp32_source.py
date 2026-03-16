@@ -27,6 +27,7 @@ import serial
 import time
 import threading
 import logging
+import queue
 from collections import deque
 
 from engine.csi_processor import CSIFrame, N_SUBCARRIERS, CSI_SAMPLE_RATE
@@ -62,6 +63,11 @@ class ESP32CSISource:
         self._packets_dropped = 0
         self._last_packet_time = None
         self._start_time = time.time()
+
+        # Shared serial connection (managed by reader thread)
+        self._ser = None
+        self._ser_lock = threading.Lock()  # protects writes to _ser
+        self._resp_queue = queue.Queue()   # RESP: lines from reader thread
 
         # Start the serial reader thread
         self._running = True
@@ -115,6 +121,7 @@ class ESP32CSISource:
         while self._running:
             try:
                 ser = serial.Serial(self.serial_port, self.baud_rate, timeout=2)
+                self._ser = ser
                 logger.info(f"ESP32CSISource connected to {self.serial_port} @ {self.baud_rate}")
                 print(f"[ESP32] Connected to {self.serial_port}")
             except serial.SerialException as e:
@@ -131,6 +138,17 @@ class ESP32CSISource:
                         logger.error(f"Serial read error: {e}")
                         break
 
+                    if not line:
+                        continue
+
+                    # Route RESP lines to the command sender
+                    if line.startswith('RESP:'):
+                        try:
+                            self._resp_queue.put_nowait(line)
+                        except queue.Full:
+                            pass
+                        continue
+
                     if not line.startswith('CSI_DATA'):
                         continue
 
@@ -145,6 +163,7 @@ class ESP32CSISource:
                     with self._lock:
                         self._frame_buffer.append(frame)
             finally:
+                self._ser = None
                 ser.close()
 
             # If we get here, serial was lost — retry
@@ -234,6 +253,88 @@ class ESP32CSISource:
         except (ValueError, IndexError) as e:
             logger.debug(f"CSI_DATA parse error: {e}")
             return None
+
+    # ── Serial command interface ─────────────────────────────────────────────
+
+    def send_command(self, command: str, timeout: float = 3.0) -> str:
+        """
+        Send a command string to the ESP32 over serial and collect the response.
+        Commands use the format: CMD:<command>:<payload>\n
+        The ESP32 responds with RESP:<status>:<message>\n
+        Returns the full response line or raises RuntimeError on timeout.
+        """
+        ser = self._ser
+        if ser is None:
+            raise RuntimeError("ESP32 serial not connected")
+
+        cmd_line = command if command.endswith('\n') else command + '\n'
+
+        # Drain any stale RESP lines
+        while not self._resp_queue.empty():
+            try:
+                self._resp_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Write command (reader thread handles all reads)
+        with self._ser_lock:
+            ser.write(cmd_line.encode('utf-8'))
+            ser.flush()
+
+        # Wait for the reader thread to forward a RESP: line
+        try:
+            return self._resp_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(f"No response from ESP32 within {timeout}s")
+
+    def set_wifi_credentials(self, ssid: str, password: str) -> dict:
+        """
+        Send new WiFi credentials to the ESP32 via serial command.
+        The ESP32 stores them in NVS and reboots to connect with the new creds.
+
+        Returns dict with 'success' bool and 'message' string.
+        """
+        if not ssid:
+            return {'success': False, 'message': 'SSID is required'}
+
+        # Protocol: CMD:WIFI_SET:<ssid>|<password>
+        cmd = f"CMD:WIFI_SET:{ssid}|{password}"
+        try:
+            resp = self.send_command(cmd, timeout=5.0)
+            # Expected: RESP:OK:WiFi credentials saved, rebooting
+            #      or:  RESP:ERR:<reason>
+            parts = resp.split(':', 2)
+            status = parts[1] if len(parts) > 1 else 'ERR'
+            message = parts[2] if len(parts) > 2 else resp
+
+            if status == 'OK':
+                logger.info(f"ESP32 WiFi credentials updated: SSID={ssid}")
+                return {'success': True, 'message': message}
+            else:
+                logger.warning(f"ESP32 WiFi set failed: {message}")
+                return {'success': False, 'message': message}
+        except RuntimeError as e:
+            logger.error(f"ESP32 WiFi set error: {e}")
+            return {'success': False, 'message': str(e)}
+
+    def get_wifi_status(self) -> dict:
+        """Query current WiFi connection status from ESP32."""
+        try:
+            resp = self.send_command("CMD:WIFI_STATUS", timeout=3.0)
+            # Expected: RESP:OK:<ssid>|<ip>|<channel>|<rssi>
+            parts = resp.split(':', 2)
+            if len(parts) >= 3 and parts[1] == 'OK':
+                fields = parts[2].split('|')
+                return {
+                    'connected': True,
+                    'ssid': fields[0] if len(fields) > 0 else '',
+                    'ip': fields[1] if len(fields) > 1 else '',
+                    'channel': fields[2] if len(fields) > 2 else '',
+                    'rssi': fields[3] if len(fields) > 3 else '',
+                }
+            return {'connected': False, 'ssid': '', 'ip': '', 'error': resp}
+        except RuntimeError:
+            return {'connected': False, 'ssid': '', 'ip': '', 'error': 'No response'}
 
     def stop(self):
         """Shut down the serial reader thread."""

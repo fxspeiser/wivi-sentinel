@@ -46,6 +46,7 @@ ESP_IDF_DIR="${ESP_IDF_DIR:-$HOME/esp/esp-idf}"
 ESP_CSI_DIR="${ESP_CSI_DIR:-$HOME/esp/esp-csi}"
 ESP_IDF_BRANCH="release/v5.4"  # stable release with ESP32 CSI support
 FIRMWARE_DIR="examples/get-started/csi_recv_router"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ─── Detect OS ───────────────────────────────────────────────────────────────
 
@@ -179,6 +180,39 @@ PROJ_DIR="$ESP_CSI_DIR/$FIRMWARE_DIR"
 cd "$PROJ_DIR"
 log "Working directory: $PROJ_DIR"
 
+# ─── Patch firmware with Wi-Vi UART command + NVS WiFi support ─────────────
+
+PATCH_DIR="$SCRIPT_DIR/firmware/csi_recv_router/main"
+if [ -d "$PATCH_DIR" ]; then
+    log "Patching firmware with Wi-Vi Sentinel extensions..."
+    # Copy patched app_main.c (replaces example_connect with NVS WiFi loader)
+    # and new source files (UART command handler, NVS WiFi helpers)
+    cp "$PATCH_DIR/app_main.c" \
+       "$PATCH_DIR/uart_cmd.c" "$PATCH_DIR/uart_cmd.h" \
+       "$PATCH_DIR/wifi_nvs.c" "$PATCH_DIR/wifi_nvs.h" \
+       "$PROJ_DIR/main/"
+
+    # CMakeLists.txt uses SRC_DIRS "." so new .c files are auto-included.
+
+    # Remove protocol_examples_common dependency from the project-level CMakeLists.txt
+    # since our patched app_main.c replaces example_connect() with wifi_init_sta().
+    PROJ_CMAKE="$PROJ_DIR/CMakeLists.txt"
+    if [ -f "$PROJ_CMAKE" ] && grep -q "protocol_examples_common" "$PROJ_CMAKE"; then
+        log "Removing protocol_examples_common dependency (replaced by wifi_nvs)..."
+        if [ "$OS" = "Darwin" ]; then
+            sed -i '' '/EXTRA_COMPONENT_DIRS.*protocol_examples_common/d' "$PROJ_CMAKE"
+            sed -i '' '/protocol_examples_common/d' "$PROJ_CMAKE"
+        else
+            sed -i '/EXTRA_COMPONENT_DIRS.*protocol_examples_common/d' "$PROJ_CMAKE"
+            sed -i '/protocol_examples_common/d' "$PROJ_CMAKE"
+        fi
+    fi
+
+    log "Firmware patched"
+else
+    warn "Firmware patch files not found at $PATCH_DIR — skipping UART command support"
+fi
+
 # ─── Step 3: Configure firmware ─────────────────────────────────────────────
 
 echo ""
@@ -240,7 +274,28 @@ log "═══ Step 4/4: Build & Flash ═══"
 
 log "Building firmware (first build takes 3-5 minutes)..."
 idf.py set-target esp32
-idf.py build
+
+# First build attempt — may fail if managed_components need version patching
+if ! idf.py build 2>/dev/null; then
+    warn "First build attempt failed — checking for version compatibility issues..."
+
+    # The managed_components directory is created during the first build attempt.
+    # Re-run the esp_csi_gain_ctrl version fix now that it exists.
+    GAIN_CTRL_DIR="$PROJ_DIR/managed_components/espressif__esp_csi_gain_ctrl"
+    if [ -d "$GAIN_CTRL_DIR" ] && [ -n "$IDF_VER" ]; then
+        if [ ! -d "$GAIN_CTRL_DIR/$IDF_VER" ]; then
+            LATEST_VER=$(ls -d "$GAIN_CTRL_DIR"/[0-9]* 2>/dev/null | sort -V | tail -1)
+            if [ -n "$LATEST_VER" ]; then
+                LATEST_BASE=$(basename "$LATEST_VER")
+                log "esp_csi_gain_ctrl: copying $LATEST_BASE → $IDF_VER (version compatibility)"
+                cp -r "$LATEST_VER" "$GAIN_CTRL_DIR/$IDF_VER"
+            fi
+        fi
+    fi
+
+    log "Retrying build..."
+    idf.py build
+fi
 
 log "Flashing firmware to $SERIAL_PORT..."
 idf.py flash -p "$SERIAL_PORT"

@@ -1091,6 +1091,12 @@ export default function App() {
   const [viewMode, setViewMode] = useState("cards"); // "cards" or "compact"
   const [connected, setConnected]   = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
+  const [wifiOpen, setWifiOpen]     = useState(false);
+  const [wifiSsid, setWifiSsid]    = useState('');
+  const [wifiPass, setWifiPass]     = useState('');
+  const [wifiSaving, setWifiSaving] = useState(false);
+  const [wifiMsg, setWifiMsg]       = useState(null);
+  const [wifiStatus, setWifiStatus] = useState(null);
 
   const t = darkMode ? THEMES.dark : THEMES.light;
 
@@ -1121,6 +1127,33 @@ export default function App() {
   const handleTag     = async (id, name) => { try { await fetch(`${API}/profiles/tag`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile_id: id, nickname: name }) }); fetchData(); } catch {} };
   const handleDelete  = async (id) => { try { await fetch(`${API}/profiles/${id}`, { method: "DELETE" }); fetchData(); } catch {} };
   const handleSuggest = async (profileId, deviceName) => { try { await fetch(`${API}/devices/suggest`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile_id: profileId, device_name: deviceName }) }); fetchData(); } catch {} };
+
+  const handleWifiSave = async () => {
+    if (!wifiSsid.trim()) return;
+    setWifiSaving(true);
+    setWifiMsg(null);
+    try {
+      const resp = await fetch(`${API}/esp32/wifi`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ssid: wifiSsid.trim(), password: wifiPass }),
+      });
+      const data = await resp.json();
+      setWifiMsg(data.success ? { type: 'ok', text: data.message || 'Saved! ESP32 rebooting...' } : { type: 'err', text: data.message || data.error || 'Failed' });
+      if (data.success) { setWifiSsid(''); setWifiPass(''); }
+    } catch (e) { setWifiMsg({ type: 'err', text: 'Network error' }); }
+    setWifiSaving(false);
+  };
+
+  const fetchWifiStatus = async () => {
+    try {
+      const resp = await fetch(`${API}/esp32/wifi`);
+      const data = await resp.json();
+      setWifiStatus(data);
+    } catch { setWifiStatus(null); }
+  };
+
+  useEffect(() => { if (wifiOpen && status?.csi_source === 'esp32') fetchWifiStatus(); }, [wifiOpen, status?.csi_source]);
 
   const newIds = new Set(profiles.filter(p => p.detection_count <= 3 && !p.nickname).map(p => p.id));
 
@@ -1282,6 +1315,70 @@ export default function App() {
                 <div style={{ color: t.awaiting, fontSize: 10, fontWeight: 600, padding: "4px 0", letterSpacing: "0.08em" }}>SCANNING...</div>
               )}
             </div>
+
+            {status?.csi_source === 'esp32' && (
+              <div>
+                <div
+                  onClick={() => setWifiOpen(o => !o)}
+                  style={{ fontSize: 9, color: t.textMid, letterSpacing: "0.15em", fontWeight: 700, marginBottom: 6, paddingBottom: 5, borderBottom: `1px solid ${t.border}`, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                >
+                  <span>ESP32 WIFI</span>
+                  <span style={{ fontSize: 11, transform: wifiOpen ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s" }}>&#9654;</span>
+                </div>
+                {wifiOpen && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {wifiStatus?.connected && (
+                      <div style={{ fontSize: 9, color: t.green, fontWeight: 600, padding: "3px 0" }}>
+                        Connected: {wifiStatus.ssid} ({wifiStatus.ip})
+                      </div>
+                    )}
+                    <input
+                      type="text"
+                      placeholder="New SSID (2.4 GHz)"
+                      value={wifiSsid}
+                      onChange={e => setWifiSsid(e.target.value)}
+                      style={{
+                        background: t.bgInput, border: `1px solid ${t.border}`, borderRadius: 4,
+                        color: t.textPrimary, padding: "5px 8px", fontSize: 10,
+                        fontFamily: "'JetBrains Mono', monospace", outline: "none",
+                      }}
+                    />
+                    <input
+                      type="password"
+                      placeholder="Password"
+                      value={wifiPass}
+                      onChange={e => setWifiPass(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && handleWifiSave()}
+                      style={{
+                        background: t.bgInput, border: `1px solid ${t.border}`, borderRadius: 4,
+                        color: t.textPrimary, padding: "5px 8px", fontSize: 10,
+                        fontFamily: "'JetBrains Mono', monospace", outline: "none",
+                      }}
+                    />
+                    <button
+                      onClick={handleWifiSave}
+                      disabled={wifiSaving || !wifiSsid.trim()}
+                      style={{
+                        background: wifiSaving ? t.bgInput : hexToRgba(t.green, 0.12),
+                        border: `1px solid ${hexToRgba(t.green, 0.3)}`,
+                        color: wifiSaving ? t.textMuted : t.green,
+                        borderRadius: 4, padding: "5px 8px", fontSize: 10, fontWeight: 700,
+                        fontFamily: "'JetBrains Mono', monospace", cursor: wifiSaving ? "wait" : "pointer",
+                        letterSpacing: "0.06em",
+                      }}
+                    >{wifiSaving ? "SENDING..." : "SET WIFI"}</button>
+                    {wifiMsg && (
+                      <div style={{ fontSize: 9, fontWeight: 600, color: wifiMsg.type === 'ok' ? t.green : '#ef4444', padding: "2px 0" }}>
+                        {wifiMsg.text}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 8, color: t.textMuted, lineHeight: 1.4 }}>
+                      ESP32 saves creds to NVS and reboots. 2.4 GHz networks only.
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div style={{ flex: 1 }}>
               <SectionLabel>LIVE FEED</SectionLabel>
