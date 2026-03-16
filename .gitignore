@@ -37,3 +37,4 @@ logs/
 # Node (for dashboard dev)
 node_modules/
 dist/
+data/profiles.json
