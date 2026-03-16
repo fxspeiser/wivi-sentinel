@@ -977,6 +977,81 @@ function EventFeed({ events }) {
   );
 }
 
+// ─── Compact Row ─────────────────────────────────────────────────────────────
+// One target per row for the compact list view.
+
+function CompactRow({ profile, onTag }) {
+  const t = useContext(ThemeContext);
+  const [editing, setEditing] = useState(false);
+  const [nickname, setNickname] = useState(profile.nickname || "");
+
+  const isHB = profile.sig_type === "heartbeat";
+  const accent = isHB ? "#ff3e6c" : "#00b4d8";
+  const icon = isHB ? "♥" : "⦿";
+  const m = profile.metadata || {};
+  const dir = m.direction || "unknown";
+  const dist = estimateDistance(m.body_attenuation);
+  const lastSeen = profile.last_seen;
+  const isApproaching = dir === "approaching";
+
+  // Fade based on time since last seen: fully opaque if < 5min, fades after
+  const ageSec = lastSeen ? (Date.now() - new Date(lastSeen).getTime()) / 1000 : Infinity;
+  const ageHours = ageSec / 3600;
+  const opacity = ageHours >= 1 ? 0.3 : ageSec > 300 ? Math.max(0.4, 1 - (ageSec - 300) / 3300) : 1;
+
+  const handleSave = () => { if (nickname.trim()) { onTag(profile.id, nickname.trim()); setEditing(false); } };
+
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 10, padding: "7px 12px",
+      background: isApproaching ? "rgba(239,68,68,0.06)" : t.bgCard,
+      border: `1px solid ${isApproaching ? "rgba(239,68,68,0.3)" : t.border}`,
+      borderRadius: 6, opacity, transition: "opacity 0.5s ease, background 0.2s ease",
+      animation: isApproaching ? "approachGlow 3s ease-in-out infinite" : undefined,
+    }}>
+      {/* Direction + Type icon */}
+      <span style={{ fontSize: 14, color: accent, textShadow: `0 0 6px ${accent}`, flexShrink: 0, width: 18, textAlign: "center" }}>{icon}</span>
+
+      {/* Direction arrow */}
+      <span style={{ fontSize: 13, color: dirColor(dir), fontWeight: 700, flexShrink: 0, width: 16 }}>{dirIcon(dir)}</span>
+
+      {/* Name / tag */}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {editing ? (
+          <div style={{ display: "flex", gap: 4 }}>
+            <input value={nickname} onChange={e => setNickname(e.target.value)} onKeyDown={e => e.key === "Enter" && handleSave()} placeholder="Tag..." autoFocus
+              style={{ background: t.bgInput, border: `1px solid ${t.green}`, borderRadius: 3, color: t.textPrimary, padding: "2px 6px", fontSize: 11, fontFamily: "'JetBrains Mono', monospace", outline: "none", width: 100 }} />
+            <button onClick={handleSave} style={{ background: hexToRgba(t.green, 0.13), border: `1px solid ${t.green}`, color: t.green, borderRadius: 3, padding: "2px 6px", cursor: "pointer", fontSize: 10, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>OK</button>
+          </div>
+        ) : (
+          <div onClick={() => setEditing(true)} style={{ color: profile.nickname ? t.textPrimary : t.textMuted, fontSize: 12, fontWeight: 600, cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title="Click to tag">
+            {profile.nickname || profile.id.slice(0, 10)}
+          </div>
+        )}
+      </div>
+
+      {/* Species badge */}
+      <span style={{ fontSize: 12, flexShrink: 0 }}>{speciesIcon(m.species)}</span>
+      <span style={{ fontSize: 10, color: speciesColor(m.species, t.green), fontWeight: 700, flexShrink: 0, width: 42, textAlign: "center" }}>{(m.species || "?").toUpperCase().slice(0, 5)}</span>
+
+      {/* Key metric */}
+      <span style={{ fontSize: 11, color: t.textPrimary, fontWeight: 700, flexShrink: 0, width: 55, textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
+        {isHB ? (m.bpm ? `${m.bpm} bpm` : "—") : (m.cadence_spm ? `${m.cadence_spm} spm` : "—")}
+      </span>
+
+      {/* Distance */}
+      <span style={{ fontSize: 11, color: dirColor(dir), fontWeight: 700, flexShrink: 0, width: 50, textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
+        {dist || "—"}
+      </span>
+
+      {/* Last seen */}
+      <span style={{ fontSize: 10, color: t.textSecondary, fontWeight: 500, flexShrink: 0, width: 55, textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
+        {timeAgo(lastSeen)}
+      </span>
+    </div>
+  );
+}
+
 // ─── Filter Button ───────────────────────────────────────────────────────────
 
 function FilterBtn({ label, active, color, count, onClick }) {
@@ -1010,6 +1085,7 @@ export default function App() {
   const [devices, setDevices]   = useState({});
   const [filter, setFilter]     = useState("all");
   const [sortBy, setSortBy]     = useState("last_seen");
+  const [viewMode, setViewMode] = useState("cards"); // "cards" or "compact"
   const [connected, setConnected]   = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
 
@@ -1082,6 +1158,23 @@ export default function App() {
     list = [...list].sort(sorters[sortBy] || sorters.last_seen);
     return [...list.filter(p => newIds.has(p.id)), ...list.filter(p => !newIds.has(p.id))];
   }, [profiles, filter, sortBy, newIds]);
+
+  // Compact view: sorted by distance (closest first), then last-seen; stale (>1hr) sinks to bottom
+  const compactSorted = useMemo(() => {
+    const now = Date.now();
+    const oneHour = 3600 * 1000;
+    return [...filtered].sort((a, b) => {
+      const aStale = a.last_seen ? (now - new Date(a.last_seen).getTime()) > oneHour : true;
+      const bStale = b.last_seen ? (now - new Date(b.last_seen).getTime()) > oneHour : true;
+      if (aStale !== bStale) return aStale ? 1 : -1;
+      const aDist = a.metadata?.body_attenuation || 0;
+      const bDist = b.metadata?.body_attenuation || 0;
+      // Higher attenuation = closer → sort descending by attenuation
+      if (Math.abs(aDist - bDist) > 0.01) return bDist - aDist;
+      // Then by last seen (most recent first)
+      return new Date(b.last_seen || 0) - new Date(a.last_seen || 0);
+    });
+  }, [filtered]);
 
   const SectionLabel = ({ children }) => (
     <div style={{ fontSize: 9, color: t.textMid, letterSpacing: "0.15em", fontWeight: 700, marginBottom: 6, paddingBottom: 5, borderBottom: `1px solid ${t.border}` }}>{children}</div>
@@ -1210,11 +1303,45 @@ export default function App() {
               ))}
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))", gap: 12 }}>
-              {filtered.map(p => (
-                <ProfileCard key={p.id} profile={p} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} isNew={newIds.has(p.id)} />
+            {/* View toggle */}
+            <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
+              {[["cards", "CARDS"], ["compact", "COMPACT"]].map(([k, l]) => (
+                <button key={k} onClick={() => setViewMode(k)} style={{
+                  padding: "5px 14px", borderRadius: 4, cursor: "pointer",
+                  background: viewMode === k ? hexToRgba(t.green, 0.1) : "transparent",
+                  border: viewMode === k ? `1px solid ${hexToRgba(t.green, 0.35)}` : `1px solid ${t.border}`,
+                  color: viewMode === k ? t.green : t.textSecondary,
+                  fontSize: 10, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: "0.1em",
+                }}>{l}</button>
               ))}
             </div>
+
+            {viewMode === "compact" ? (
+              <>
+                {/* Compact header row */}
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 12px", marginBottom: 4, fontSize: 9, color: t.textMuted, fontWeight: 700, letterSpacing: "0.1em" }}>
+                  <span style={{ width: 18 }}></span>
+                  <span style={{ width: 16 }}>DIR</span>
+                  <span style={{ flex: 1 }}>TARGET</span>
+                  <span style={{ width: 12 }}></span>
+                  <span style={{ width: 42, textAlign: "center" }}>TYPE</span>
+                  <span style={{ width: 55, textAlign: "right" }}>METRIC</span>
+                  <span style={{ width: 50, textAlign: "right" }}>DIST</span>
+                  <span style={{ width: 55, textAlign: "right" }}>SEEN</span>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {compactSorted.map(p => (
+                    <CompactRow key={p.id} profile={p} onTag={handleTag} />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))", gap: 12 }}>
+                {filtered.map(p => (
+                  <ProfileCard key={p.id} profile={p} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} isNew={newIds.has(p.id)} />
+                ))}
+              </div>
+            )}
             {filtered.length === 0 && (
               <div style={{ textAlign: "center", padding: 60, color: t.textDim, fontSize: 13, fontWeight: 600, letterSpacing: "0.1em" }}>NO SIGNATURES MATCHING FILTER</div>
             )}

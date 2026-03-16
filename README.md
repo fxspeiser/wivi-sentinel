@@ -1,51 +1,153 @@
 # Wi-Vi Sentinel
 
 WiFi CSI biometric detection, classification, and tracking system.
-Passive through-wall sensing using a Raspberry Pi 4 + Nexmon CSI firmware.
+Passive through-wall sensing using an ESP32 + Raspberry Pi 4.
 
 ## How It Works
 
 ```
-                         WiFi signals
+                         WiFi signals (2.4 GHz)
   [Your Router] ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
        │                                      │
-       │ Ethernet                    (bodies disturb signal)
+       │                            (bodies disturb signal)
        │                                      │
-  [Raspberry Pi 4] ◄─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-       │  BCM43455c0 in monitor mode
-       │  Extracts CSI from every packet
-       │
-       │ UDP :5500 (CSI frames) over Ethernet
-       │
-  [Your Mac / Linux machine]
+       │         [ESP32-DevKitC-32E] ◄─ ─ ─ ─ ┘
+       │              │  Captures CSI (Channel State Information)
+       │              │  from every WiFi packet on the network
+       │              │
+       │              │ USB serial @ 921600 baud
+       │              │
+  [Raspberry Pi 4] ◄──┘
        │  server.py — signal processing, classification
        │  Species / sex / direction / device correlation
        │
-       └──► http://localhost:5555  (or :3000 in dev mode)
+       └──► http://<pi-ip>:5555
              Wi-Vi Sentinel Dashboard
 ```
+
+The ESP32 connects to your 2.4 GHz WiFi network and extracts CSI
+(Channel State Information) from every packet. CSI captures how radio
+signals are distorted by nearby bodies — breathing modulates the signal
+at ~0.2 Hz, heartbeats at ~1 Hz, and walking creates distinctive gait
+patterns.
+
+The Pi reads CSI frames over USB serial, classifies detected biometric
+signatures (species, sex, direction of movement), and serves a real-time
+dashboard.
 
 ---
 
 ## Hardware Required
 
-- **Raspberry Pi 4 Model B** (any RAM variant)
-- **Micro SD card** (16 GB+)
-- **USB-C power supply** (official Pi 4 PSU recommended)
-- **Ethernet cable** — required; onboard WiFi goes into monitor mode
-- **Your existing router** — provides the WiFi signal to sense
+- **ESP32-DevKitC-32E** — CSI capture device (~$10)
+- **Raspberry Pi 4 Model B** (any RAM variant) — runs the server
+- **USB-A to Micro-USB cable** — connects ESP32 to Pi
+- **Micro SD card** (16 GB+) for the Pi
+- **USB-C power supply** for the Pi
+- **Your existing router** — must broadcast on **2.4 GHz** (ESP32 is 2.4 GHz only)
+
+> **Note:** The Pi does **not** need an Ethernet connection. The ESP32 handles
+> CSI capture over USB, leaving the Pi's WiFi free for network connectivity
+> and serving the dashboard.
+
+---
+
+## Quick Start
+
+### 1. Flash the ESP32
+
+On your Mac or Linux machine (not the Pi):
+
+```bash
+chmod +x setup_esp32.sh
+./setup_esp32.sh
+```
+
+This script automates the full ESP32 setup:
+- Installs ESP-IDF (Espressif IoT Development Framework)
+- Clones the esp-csi repository
+- Prompts for your 2.4 GHz WiFi credentials
+- Builds and flashes the `csi_recv_router` firmware
+
+You can also set environment variables to skip the prompts:
+
+```bash
+WIFI_SSID="YourNetwork" WIFI_PASSWORD="YourPassword" ./setup_esp32.sh
+```
+
+See [ESP32 Setup Details](#esp32-setup-details) for manual steps and troubleshooting.
+
+### 2. Set up the Raspberry Pi
+
+Flash **Raspberry Pi OS Lite** with Raspberry Pi Imager. In settings:
+- Enable SSH
+- Set username/password
+- Configure WiFi
+
+Boot the Pi that, SSH in, and install dependencies:
+
+```bash
+ssh pi@raspberrypi.local
+sudo apt update && sudo apt install python3 python3-pip python3-venv
+```
+
+### 3. Deploy Wi-Vi Sentinel to the Pi
+
+From your Mac, copy the project files:
+
+```bash
+scp -r . pi@raspberrypi.local:~/wivi-sentinel/
+```
+
+On the Pi:
+
+```bash
+cd ~/wivi-sentinel
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 4. Connect the ESP32
+
+1. Unplug the ESP32 from your Mac
+2. Plug it into the Pi's USB port
+3. Verify the serial device appears:
+
+```bash
+ls /dev/ttyUSB*   # should show /dev/ttyUSB0
+```
+
+### 5. Configure and run
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Set:
+```dotenv
+CSI_SOURCE=esp32
+ESP32_SERIAL_PORT=/dev/ttyUSB0
+ESP32_BAUD_RATE=921600
+```
+
+Start the server:
+```bash
+python3 server.py
+```
+
+Open `http://<pi-ip>:5555` in your browser.
 
 ---
 
 ## Host Machine Setup (Mac / Linux)
 
-The host machine runs `server.py` — it receives CSI frames from the Pi, classifies them, and serves the dashboard. Any machine on the same LAN works.
+You can also run `server.py` on your Mac/Linux machine instead of the Pi
+(useful for development or when the ESP32 is plugged directly into your machine).
 
 ### Prerequisites
 
 **macOS**
-
-Python 3 and Node.js are the only requirements. Both are available via [Homebrew](https://brew.sh):
 
 ```bash
 brew install python node
@@ -105,7 +207,7 @@ python3 server.py &    # Flask API on :5555
 npm run dev            # Vite dev server on :3000, proxies /api to Flask
 ```
 
-### Simulated mode (no Pi required)
+### Simulated mode (no hardware required)
 
 ```bash
 python3 server.py
@@ -115,86 +217,72 @@ Generates 5 synthetic entities (3 humans, 1 dog, 1 cat) with realistic biometric
 
 ---
 
-## Pi Setup
+## ESP32 Setup Details
 
-### 1. Flash Raspberry Pi OS
+### What the setup script does
 
-Download **Raspberry Pi OS Lite (32-bit, Bullseye)** from the Raspberry Pi website.
+`setup_esp32.sh` performs these steps:
 
-Flash with Raspberry Pi Imager. In imager settings:
-- Enable SSH
-- Set username/password
-- Configure WiFi (temporary — for initial setup only)
+1. **Installs ESP-IDF** — Espressif's IoT Development Framework (release/v5.4)
+2. **Clones esp-csi** — Espressif's CSI tools and examples
+3. **Configures firmware** — writes WiFi credentials and CSI settings to `sdkconfig.defaults.user`
+4. **Handles version compatibility** — copies prebuilt libraries for newer ESP-IDF versions
+5. **Builds and flashes** — compiles `csi_recv_router` firmware and flashes it to the ESP32
 
-### 2. Boot and connect
+### Manual ESP32 setup
 
-```bash
-ssh pi@raspberrypi.local
-```
-
-### 3. Copy files to the Pi
+If you prefer to set up manually or the script doesn't work:
 
 ```bash
-ssh pi@raspberrypi.local "mkdir -p /tmp/wivi_pi_files"
-scp setup_pi.sh pi@raspberrypi.local:/tmp/wivi_pi_files/
-scp csi_extractor.py pi@raspberrypi.local:/tmp/wivi_pi_files/
+# 1. Install ESP-IDF
+mkdir -p ~/esp
+git clone --recursive --branch release/v5.4 \
+    https://github.com/espressif/esp-idf.git ~/esp/esp-idf
+cd ~/esp/esp-idf && ./install.sh esp32
+source ~/esp/esp-idf/export.sh
+
+# 2. Clone esp-csi
+git clone https://github.com/espressif/esp-csi.git ~/esp/esp-csi
+
+# 3. Build and flash
+cd ~/esp/esp-csi/examples/get-started/csi_recv_router
+idf.py set-target esp32
+idf.py menuconfig   # Set WiFi SSID/password under "Example Configuration"
+idf.py build
+idf.py flash -p /dev/cu.usbserial-110   # your port may differ
 ```
 
-### 4. Run setup
+### Verifying CSI output
 
 ```bash
-cd /tmp/wivi_pi_files
-chmod +x setup_pi.sh
-sudo ./setup_pi.sh
+source ~/esp/esp-idf/export.sh
+cd ~/esp/esp-csi/examples/get-started/csi_recv_router
+idf.py monitor -p /dev/cu.usbserial-110
 ```
 
-Takes 15–30 minutes. Installs Nexmon, patches BCM43455c0 firmware, creates
-systemd service and convenience scripts.
+You should see WiFi connection logs followed by `CSI_DATA` lines. Press the
+**EN/RST** button on the ESP32 if no output appears. Quit with `Ctrl+]`.
 
-### 5. Configure
+### Generating WiFi traffic
+
+The ESP32 captures CSI from WiFi packets on the network. More traffic means
+more CSI frames. To generate traffic, ping the router from the Pi:
 
 ```bash
-sudo nano /opt/wivi-sentinel/config.json
+ping 192.168.1.1
 ```
 
-```json
-{
-    "mac_ip": "192.168.1.71",
-    "udp_port": 5500,
-    "monitor_channel": 36,
-    "bandwidth": 80,
-    "interface": "wlan0",
-    "sample_rate": 100,
-    "auto_discover_mac": true,
-    "log_level": "INFO"
-}
-```
+---
 
-- **mac_ip** — your Mac's local IP. Find it: hold Option + click WiFi icon → TCP/IP.
-  Or set `"auto"` for the Pi to discover it.
-- **monitor_channel** — your router's primary WiFi channel.
-  Find it on Mac: hold Option + click WiFi icon → Channel.
-- **bandwidth** — match your router (80 MHz is common for 5 GHz).
+## Nexmon CSI (Legacy)
 
-### 6. Start on the Pi
+The original architecture used the Pi 4's onboard BCM43455c0 WiFi chip with
+Nexmon CSI firmware in monitor mode. This required Ethernet for connectivity
+(since WiFi was in monitor mode) and a specific Nexmon firmware patch.
 
-**Connect Ethernet first** — monitor mode disables WiFi connectivity.
-
-```bash
-wivi-start
-```
-
-```bash
-wivi-status          # check service and config
-wivi-stop            # stop and restore normal WiFi
-sudo journalctl -u wivi-csi -f   # live logs
-```
-
-### 7. Start the dashboard in live mode
-
-```bash
-CSI_SOURCE=nexmon python3 server.py
-```
+If you prefer the Nexmon approach, see `setup_pi.sh` and set `CSI_SOURCE=nexmon`
+in your `.env`. Note that Nexmon firmware compatibility varies by kernel version
+and may require troubleshooting.
 
 ---
 
@@ -238,8 +326,10 @@ cp .env.example .env
 |---|---|---|
 | `FLASK_PORT` | `5555` | Port the Flask API server listens on |
 | `VITE_PORT` | `3000` | Port the Vite dev server listens on |
-| `CSI_SOURCE` | `simulated` | `simulated` or `nexmon` |
-| `CSI_UDP_PORT` | `5500` | UDP port for Nexmon CSI frames from the Pi |
+| `CSI_SOURCE` | `simulated` | `simulated`, `esp32`, or `nexmon` |
+| `ESP32_SERIAL_PORT` | `/dev/ttyUSB0` | Serial port for ESP32 USB connection |
+| `ESP32_BAUD_RATE` | `921600` | Baud rate (must match firmware config) |
+| `CSI_UDP_PORT` | `5500` | UDP port for Nexmon CSI frames (legacy) |
 | `PROBE_IFACE` | _(none)_ | Monitor interface for probe sniffing (e.g. `mon0`) |
 
 `.env` is gitignored. `.env.example` is committed as a reference template.
@@ -250,17 +340,12 @@ cp .env.example .env
 # Disabled — mDNS still runs, probe sniffing off (default)
 PROBE_IFACE=
 
-# Nexmon monitor interface created by setup_pi.sh (most common)
+# Nexmon monitor interface created by setup_pi.sh (legacy setup)
 PROBE_IFACE=mon0
-
-# If Nexmon puts the interface directly into monitor mode without a separate mon interface
-PROBE_IFACE=wlan0
 
 # Some setups name it differently — check with: iw dev
 PROBE_IFACE=wlan0mon
 ```
-
-> **Note:** `PROBE_IFACE` is read on the **Mac** side only. It tells `server.py` which interface name to pass to `DeviceScanner` for sniffing probe requests forwarded over the network. Set it to the monitor interface visible to `server.py`, not the Pi's local name.
 
 ---
 
@@ -268,13 +353,15 @@ PROBE_IFACE=wlan0mon
 
 ```
 wivi-sentinel/
-├── server.py               # Flask API server
+├── server.py               # Flask API server + detection loop
 ├── engine/
-│   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore, DeviceCorrelator
+│   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore
+│   ├── esp32_source.py     # ESP32 CSI source (USB serial)
+│   ├── nexmon_source.py    # Nexmon CSI source (UDP, legacy)
 │   └── device_scanner.py   # mDNS + probe request device discovery
-├── csi_extractor.py        # Pi-side CSI capture and UDP forwarding
-├── nexmon_source.py        # Live Nexmon CSI source (NexmonCSISource)
-├── setup_pi.sh             # Pi setup script (Nexmon build + service install)
+├── setup_esp32.sh          # ESP32 firmware setup script
+├── setup_pi.sh             # Pi setup script (Nexmon, legacy)
+├── csi_extractor.py        # Pi-side CSI capture for Nexmon (legacy)
 ├── src/                    # Vite/React dashboard source
 │   ├── main.jsx
 │   ├── App.jsx
@@ -284,7 +371,7 @@ wivi-sentinel/
 ├── vite.config.js
 ├── package.json
 ├── requirements.txt
-├── .env.example            # reference config (commit this; copy to .env locally)
+├── .env.example            # Reference config (copy to .env locally)
 └── data/
     └── profiles.json       # Biometric profiles (gitignored)
 ```
@@ -292,6 +379,46 @@ wivi-sentinel/
 ---
 
 ## Troubleshooting
+
+### ESP32
+
+**No serial device found**
+```bash
+ls /dev/ttyUSB*          # Linux / Pi
+ls /dev/cu.usbserial-*   # macOS
+```
+If nothing appears, try a different USB cable (some are charge-only) or port.
+
+**ESP32 not sending CSI_DATA**
+- Verify the ESP32 is connected to your WiFi: look for `sta ip:` in the boot log
+- Make sure your router broadcasts on **2.4 GHz** (ESP32 cannot connect to 5 GHz)
+- Press the **EN/RST** button on the ESP32 to reboot it
+- Generate WiFi traffic: `ping <router-ip>` from any device on the network
+
+**Garbage characters in serial monitor**
+- Baud rate mismatch. The firmware is configured for 921600 baud. Use:
+  ```bash
+  idf.py monitor -p /dev/cu.usbserial-110
+  ```
+  (reads baud rate from sdkconfig automatically)
+
+**Build error: esp_csi_gain_ctrl missing version**
+```
+No rule to make target .../6.1/esp32/libesp_csi_gain_ctrl.a
+```
+The prebuilt library doesn't have your ESP-IDF version yet. Copy the closest:
+```bash
+cd managed_components/espressif__esp_csi_gain_ctrl
+cp -r 6.0 6.1   # adjust versions as needed
+```
+
+**`invalid header: 0xffffffff` in boot log**
+- The ESP32 flash is empty or corrupted. Reflash:
+  ```bash
+  idf.py flash -p /dev/cu.usbserial-110
+  ```
+
+### Nexmon (legacy)
 
 **Pi not sending data**
 ```bash

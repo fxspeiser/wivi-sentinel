@@ -55,9 +55,14 @@ def assets(filename):
 # Set environment variable to switch sources:
 #   CSI_SOURCE=simulated  (default — synthetic demo data)
 #   CSI_SOURCE=nexmon     (live from Raspberry Pi 4 over UDP)
+#   CSI_SOURCE=esp32      (live from ESP32 via USB serial)
 #
 # For Nexmon, also set:
 #   CSI_UDP_PORT=5500     (UDP port the Pi sends to)
+#
+# For ESP32, also set:
+#   ESP32_SERIAL_PORT=/dev/ttyUSB0  (serial port for ESP32)
+#   ESP32_BAUD_RATE=115200          (baud rate, default 115200)
 #
 
 CSI_MODE = os.environ.get('CSI_SOURCE', 'simulated').lower()
@@ -68,6 +73,12 @@ if CSI_MODE == 'nexmon':
     csi_source = NexmonCSISource(udp_port=udp_port)
     print(f"[LIVE] Nexmon CSI source on UDP port {udp_port}")
     print(f"[LIVE] Waiting for Pi 4 to connect...")
+elif CSI_MODE == 'esp32':
+    from engine.esp32_source import ESP32CSISource
+    serial_port = os.environ.get('ESP32_SERIAL_PORT', '/dev/ttyUSB0')
+    baud_rate = int(os.environ.get('ESP32_BAUD_RATE', '115200'))
+    csi_source = ESP32CSISource(serial_port=serial_port, baud_rate=baud_rate)
+    print(f"[LIVE] ESP32 CSI source on {serial_port} @ {baud_rate}")
 else:
     csi_source = SimulatedCSISource(n_people=5, seed=42)
     print(f"[SIM] Simulated CSI source (5 entities)")
@@ -310,9 +321,9 @@ def get_status():
         'uptime': time.time(),
     }
 
-    # Add Nexmon-specific status
+    # Add source-specific status
     if hasattr(csi_source, 'get_status_info'):
-        result['nexmon'] = csi_source.get_status_info()
+        result['source_info'] = csi_source.get_status_info()
 
     return jsonify(result)
 
