@@ -642,7 +642,12 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, newIds }) 
 
                   {/* Metrics grid */}
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontSize: 11, fontWeight: 500, marginBottom: 10 }}>
-                    {selectedProfile.sig_type === 'heartbeat' ? (<>
+                    {selectedProfile.sig_type === 'combined' ? (<>
+                      <div><span style={{ color: t.textSecondary }}>BPM </span><span style={{ color: '#ff3e6c', fontWeight: 700 }}>{sm.bpm || '—'}</span></div>
+                      <div><span style={{ color: t.textSecondary }}>RESP </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.respiratory_rate || '—'}/m</span></div>
+                      <div><span style={{ color: t.textSecondary }}>CADENCE </span><span style={{ color: '#00b4d8', fontWeight: 700 }}>{sm.cadence_spm || '—'} spm</span></div>
+                      <div><span style={{ color: t.textSecondary }}>STRIDE </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.stride_regularity || '—'}</span></div>
+                    </>) : selectedProfile.sig_type === 'heartbeat' ? (<>
                       <div><span style={{ color: t.textSecondary }}>BPM </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.bpm || '—'}</span></div>
                       <div><span style={{ color: t.textSecondary }}>RESP </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{sm.respiratory_rate || '—'}/m</span></div>
                     </>) : (<>
@@ -770,8 +775,9 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
   const [waveData] = useState(() => Array.from({ length: 60 }, (_, i) => Math.sin(i * 0.3 + Math.random() * 0.5) * (0.5 + Math.random() * 0.5)));
 
   const isHB = profile.sig_type === "heartbeat";
-  const accent = isHB ? "#ff3e6c" : "#00b4d8";
-  const icon = isHB ? "♥" : "⦿";
+  const isCombined = profile.sig_type === "combined";
+  const accent = isCombined ? "#a78bfa" : isHB ? "#ff3e6c" : "#00b4d8";
+  const icon = isCombined ? "◈" : isHB ? "♥" : "⦿";
   const m = profile.metadata || {};
   const dir = m.direction || "unknown";
   const dist = estimateDistance(m.body_attenuation, m.distance_m);
@@ -843,7 +849,12 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
       <Waveform data={waveData} color={accent} width={280} height={34} />
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 10, fontSize: 12, fontWeight: 500 }}>
-        {isHB ? (<>
+        {isCombined ? (<>
+          <div><span style={{ color: t.textSecondary }}>BPM </span><span style={{ color: "#ff3e6c", fontWeight: 700 }}>{m.bpm || "—"}</span></div>
+          <div><span style={{ color: t.textSecondary }}>RESP </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{m.respiratory_rate || "—"}/m</span></div>
+          <div><span style={{ color: t.textSecondary }}>CADENCE </span><span style={{ color: "#00b4d8", fontWeight: 700 }}>{m.cadence_spm || "—"} spm</span></div>
+          <div><span style={{ color: t.textSecondary }}>STRIDE </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{m.stride_regularity || "—"}</span></div>
+        </>) : isHB ? (<>
           <div><span style={{ color: t.textSecondary }}>BPM </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{m.bpm || "—"}</span></div>
           <div><span style={{ color: t.textSecondary }}>RESP </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{m.respiratory_rate || "—"}/m</span></div>
         </>) : (<>

@@ -871,15 +871,123 @@ class ProfileStore:
 
     def get_all(self):
         with self._lock:
-            result = []
+            raw = {}
             for pid, p in self.profiles.items():
                 entry = {k: v for k, v in p.items() if k != 'signature'}
                 entry['has_signature'] = len(p.get('signature', [])) > 0
                 entry['signature_strength'] = float(np.linalg.norm(p.get('signature', [])))
-                # Never expose device candidates for non-human profiles
                 if entry.get('metadata', {}).get('species') != 'human':
                     entry.pop('device_candidates', None)
-                result.append(entry)
+                raw[pid] = entry
+
+            # ── Coalesce heartbeat + gait profiles that represent the same target ──
+            # Criteria: same species, last_seen within 5 min, distance within 3m,
+            # no conflicting sex estimation.
+            hb_ids  = [pid for pid, e in raw.items() if e['sig_type'] == 'heartbeat']
+            gait_ids = [pid for pid, e in raw.items() if e['sig_type'] == 'gait']
+
+            COALESCE_TIME_S  = 300   # 5 minutes
+            COALESCE_DIST_M  = 3.0   # metres
+
+            def _last_seen_ts(entry):
+                try:
+                    return datetime.fromisoformat(entry['last_seen']).timestamp()
+                except Exception:
+                    return 0.0
+
+            def _dist(entry):
+                m = entry.get('metadata') or {}
+                return m.get('distance_m') or (
+                    max(0.5, (1.0 - m['body_attenuation']) * 8.0 + 0.5)
+                    if m.get('body_attenuation') else None
+                )
+
+            def _sex_compatible(a, b):
+                sa = (a.get('metadata') or {}).get('sex_estimation', 'indeterminate')
+                sb = (b.get('metadata') or {}).get('sex_estimation', 'indeterminate')
+                return sa == 'indeterminate' or sb == 'indeterminate' or sa == sb
+
+            # Score candidate pairs; keep best non-overlapping set (greedy)
+            candidates = []
+            for hid in hb_ids:
+                for gid in gait_ids:
+                    he, ge = raw[hid], raw[gid]
+                    hm = he.get('metadata') or {}
+                    gm = ge.get('metadata') or {}
+                    if hm.get('species') != gm.get('species'):
+                        continue
+                    dt = abs(_last_seen_ts(he) - _last_seen_ts(ge))
+                    if dt > COALESCE_TIME_S:
+                        continue
+                    hd, gd = _dist(he), _dist(ge)
+                    if hd is not None and gd is not None and abs(hd - gd) > COALESCE_DIST_M:
+                        continue
+                    if not _sex_compatible(he, ge):
+                        continue
+                    time_score = 1.0 - dt / COALESCE_TIME_S
+                    dist_score = (1.0 - abs((hd or 4.0) - (gd or 4.0)) / COALESCE_DIST_M) if (hd and gd) else 0.5
+                    score = (time_score + dist_score) / 2.0
+                    candidates.append((score, hid, gid))
+
+            candidates.sort(reverse=True)
+            merged_hb, merged_gait = set(), set()
+            merged_pairs = []
+            for score, hid, gid in candidates:
+                if hid in merged_hb or gid in merged_gait:
+                    continue
+                merged_hb.add(hid)
+                merged_gait.add(gid)
+                merged_pairs.append((hid, gid))
+
+            # Build result: combined entries first, then unmatched
+            result = []
+            for hid, gid in merged_pairs:
+                he, ge = raw[hid], raw[gid]
+                hm = dict(he.get('metadata') or {})
+                gm = dict(ge.get('metadata') or {})
+                # Pick the more confident species/sex classification
+                primary_meta = hm if hm.get('species_confidence', 0) >= gm.get('species_confidence', 0) else gm
+                merged_meta = {**primary_meta}
+                # Always include both biometric fields
+                for k in ('bpm', 'respiratory_rate'):
+                    if k in hm:
+                        merged_meta[k] = hm[k]
+                for k in ('cadence_spm', 'stride_regularity', 'harmonic_ratio'):
+                    if k in gm:
+                        merged_meta[k] = gm[k]
+                merged_meta['signal_quality'] = max(
+                    hm.get('signal_quality', 0), gm.get('signal_quality', 0)
+                )
+                merged_meta['distance_m'] = (
+                    (_dist(he) or 0) + (_dist(ge) or 0)
+                ) / 2.0 if _dist(he) and _dist(ge) else (_dist(he) or _dist(ge))
+
+                # Prefer the tagged/nicknamed entry as primary
+                primary, secondary = (he, ge) if (he.get('tagged') or not ge.get('tagged')) else (ge, he)
+                combined = {
+                    'id': primary['id'],
+                    'nickname': primary.get('nickname') or secondary.get('nickname'),
+                    'sig_type': 'combined',
+                    'first_seen': min(he.get('first_seen',''), ge.get('first_seen','')),
+                    'last_seen': max(he.get('last_seen',''), ge.get('last_seen','')),
+                    'detection_count': he.get('detection_count', 0) + ge.get('detection_count', 0),
+                    'avg_confidence': (he.get('avg_confidence', 0) + ge.get('avg_confidence', 0)) / 2.0,
+                    'confidence_history': primary.get('confidence_history', []),
+                    'tagged': primary.get('tagged', False) or secondary.get('tagged', False),
+                    'metadata': merged_meta,
+                    'has_signature': True,
+                    'signature_strength': max(he.get('signature_strength', 0), ge.get('signature_strength', 0)),
+                    'component_ids': [hid, gid],
+                    'device_candidates': primary.get('device_candidates') or secondary.get('device_candidates'),
+                }
+                if combined.get('metadata', {}).get('species') != 'human':
+                    combined.pop('device_candidates', None)
+                result.append(combined)
+
+            for pid, entry in raw.items():
+                if pid not in merged_hb and pid not in merged_gait:
+                    result.append(entry)
+
             return result
 
     def get_signatures_for_matching(self):

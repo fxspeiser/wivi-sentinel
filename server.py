@@ -365,7 +365,20 @@ def tag_profile():
 
 @app.route('/api/profiles/<profile_id>', methods=['DELETE'])
 def delete_profile(profile_id):
-    if store.delete_profile(profile_id):
+    # If the client sent a combined profile id, also delete the component profiles.
+    # The combined entry itself isn't stored — find it by scanning get_all().
+    component_ids = []
+    for p in store.get_all():
+        if p['id'] == profile_id and p.get('sig_type') == 'combined':
+            component_ids = p.get('component_ids', [])
+            break
+
+    deleted = store.delete_profile(profile_id)
+    for cid in component_ids:
+        if cid != profile_id:
+            store.delete_profile(cid)
+
+    if deleted or component_ids:
         return jsonify({'success': True, 'scrubbed': True})
     return jsonify({'error': 'Profile not found'}), 404
 
