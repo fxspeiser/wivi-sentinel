@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 CSI_SAMPLE_RATE = 100        # Hz - CSI packet rate
 HEARTBEAT_BAND = (0.8, 2.5)  # Hz - covers 48-150 BPM
 RESPIRATION_BAND = (0.1, 0.5) # Hz - respiratory
-GAIT_CYCLE_BAND = (0.5, 4.0)  # Hz - walking cadence
+GAIT_CYCLE_BAND = (0.8, 4.0)  # Hz - walking cadence (0.8 Hz = 48 spm floor, cuts env noise)
 WINDOW_SIZE = 512             # samples per analysis window
 HOP_SIZE = 64                 # overlap hop
 N_SUBCARRIERS = 56            # 802.11n 20MHz
@@ -80,6 +80,7 @@ SPECIES_PROFILES = {
         'cadence_range': (70, 150),
         'bipedal': True,
         'gait_harmonic_ratio': (0.3, 0.7),  # 2nd/1st harmonic - bipedal symmetry
+        'prior': 1.0,                        # baseline prior (most common detection)
     },
     'dog': {
         'hr_range': (55, 160),
@@ -87,6 +88,7 @@ SPECIES_PROFILES = {
         'cadence_range': (140, 280),
         'bipedal': False,
         'gait_harmonic_ratio': (0.1, 0.35),  # quadruped has lower 2nd harmonic
+        'prior': 0.6,                        # needs stronger evidence to beat human
     },
     'cat': {
         'hr_range': (110, 260),
@@ -94,6 +96,7 @@ SPECIES_PROFILES = {
         'cadence_range': (160, 300),
         'bipedal': False,
         'gait_harmonic_ratio': (0.05, 0.3),
+        'prior': 0.5,
     },
     'large_animal': {
         'hr_range': (25, 85),
@@ -101,6 +104,7 @@ SPECIES_PROFILES = {
         'cadence_range': (40, 120),
         'bipedal': False,
         'gait_harmonic_ratio': (0.15, 0.5),
+        'prior': 0.4,                        # significant overlap with noisy human cadence
     },
 }
 
@@ -210,7 +214,7 @@ class SpeciesClassifier:
                 score += harm_score * 2.0
                 weights_sum += 2.0
 
-            scores[species] = score / (weights_sum + 1e-10)
+            scores[species] = (score / (weights_sum + 1e-10)) * prof.get('prior', 1.0)
 
         # Determine winner
         best_species = max(scores, key=scores.get)
@@ -872,6 +876,9 @@ class ProfileStore:
                 entry = {k: v for k, v in p.items() if k != 'signature'}
                 entry['has_signature'] = len(p.get('signature', [])) > 0
                 entry['signature_strength'] = float(np.linalg.norm(p.get('signature', [])))
+                # Never expose device candidates for non-human profiles
+                if entry.get('metadata', {}).get('species') != 'human':
+                    entry.pop('device_candidates', None)
                 result.append(entry)
             return result
 
@@ -883,9 +890,15 @@ class ProfileStore:
             ]
 
     def set_device_candidates(self, profile_id: str, candidates: list):
-        """Store ranked device name candidates for a profile (for UI display)."""
+        """Store ranked device name candidates for a profile (humans only)."""
         with self._lock:
             if profile_id in self.profiles:
+                species = self.profiles[profile_id].get('metadata', {}).get('species', '')
+                if species != 'human':
+                    # Clear any stale device data from non-human profiles
+                    self.profiles[profile_id].pop('device_candidates', None)
+                    self._save()
+                    return
                 self.profiles[profile_id]['device_candidates'] = candidates
                 self._save()
 

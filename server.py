@@ -186,7 +186,7 @@ def detection_loop():
             }
 
             # Process heartbeat detection
-            if hb_result['signal_quality'] > 0.15:
+            if hb_result['signal_quality'] > 0.08:
                 hb_sig = hb_result['signature']
                 stored = store.get_signatures_for_matching()
                 hb_stored = [s for s in stored if s['sig_type'] == 'heartbeat']
@@ -226,7 +226,7 @@ def detection_loop():
                 new_detections.append(detection)
 
             # Process gait detection
-            if gait_result['signal_quality'] > 0.15:
+            if gait_result['signal_quality'] > 0.08:
                 gait_sig = gait_result['signature']
                 stored = store.get_signatures_for_matching()
                 gait_stored = [s for s in stored if s['sig_type'] == 'gait']
@@ -269,7 +269,8 @@ def detection_loop():
 
             # ── Device correlation ──────────────────────────────────────────
             visible_devices = device_scanner.get_visible()
-            active_profile_ids = [d['profile_id'] for d in new_detections if d.get('profile_id')]
+            active_profile_ids = [d['profile_id'] for d in new_detections
+                                  if d.get('profile_id') and d.get('metadata', {}).get('species') == 'human']
 
             device_correlator.record_window(active_profile_ids, visible_devices)
 
@@ -278,9 +279,11 @@ def detection_loop():
                 candidates = device_correlator.get_candidates(pid, visible_devices)
                 store.set_device_candidates(pid, candidates)
 
-            # Auto-tag profiles whose suggested device association hit threshold
+            # Auto-tag profiles whose suggested device association hit threshold (humans only)
             for pid, display_name, score in device_correlator.check_auto_associations(visible_devices):
                 existing = store.profiles.get(pid, {})
+                if existing.get('metadata', {}).get('species') != 'human':
+                    continue
                 if not existing.get('nickname'):
                     store.tag_profile(pid, display_name)
                     print(f"[DeviceCorrelator] Auto-tagged profile {pid} as '{display_name}' (score={score:.3f})")
@@ -443,6 +446,10 @@ def suggest_device():
 
     if profile_id not in store.profiles:
         return jsonify({'error': 'Profile not found'}), 404
+
+    profile_species = store.profiles[profile_id].get('metadata', {}).get('species', '')
+    if profile_species != 'human':
+        return jsonify({'error': 'Device association is only available for human profiles'}), 400
 
     device_correlator.suggest(profile_id, device_name)
 
