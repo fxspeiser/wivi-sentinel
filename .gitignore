@@ -6,7 +6,6 @@ __pycache__/
 venv/
 env/
 *.egg-info/
-dist/
 build/
 
 # Data / profiles (may contain biometric signatures)
@@ -36,5 +35,3 @@ logs/
 
 # Node (for dashboard dev)
 node_modules/
-dist/
-data/profiles.json
