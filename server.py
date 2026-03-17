@@ -12,6 +12,8 @@ import json
 import threading
 import queue
 import os
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -335,6 +337,7 @@ def get_status():
         'total_profiles': len(store.profiles),
         'config': config,
         'uptime': time.time(),
+        'ruview_url': RUVIEW_URL,
     }
 
     # Add source-specific status
@@ -509,6 +512,52 @@ def esp32_wifi_status():
 
     result = csi_source.get_wifi_status()
     return jsonify(result)
+
+
+# ─── RuView Proxy ────────────────────────────────────────────────────────────
+#
+# RuView (https://github.com/ruvnet/RuView) is a complementary WiFi-based
+# pose estimation system. When running alongside Wi-Vi Sentinel it provides
+# 17-keypoint skeleton visualisation and vital signs via DensePose.
+#
+# Start RuView with Docker:
+#   docker run -p 3000:3000 -p 3001:3001 -p 5005:5005/udp \
+#     -e CSI_SOURCE=simulated ruvnet/wifi-densepose:latest
+#
+# Set RUVIEW_URL in .env to the base URL (default: http://localhost:3000).
+
+RUVIEW_URL = os.environ.get('RUVIEW_URL', 'http://localhost:3000').rstrip('/')
+
+
+def _ruview_get(path, timeout=2.0):
+    """Proxy a GET request to RuView. Returns (data_dict, status_code)."""
+    try:
+        url = f"{RUVIEW_URL}{path}"
+        req = urllib.request.urlopen(url, timeout=timeout)
+        data = json.loads(req.read().decode())
+        return data, req.status
+    except urllib.error.HTTPError as e:
+        return {'error': e.reason}, e.code
+    except Exception as e:
+        return {'error': str(e), 'reachable': False}, 503
+
+
+@app.route('/api/ruview/status')
+def ruview_status():
+    data, code = _ruview_get('/health')
+    return jsonify({'ruview_url': RUVIEW_URL, 'reachable': code == 200, 'detail': data}), 200
+
+
+@app.route('/api/ruview/pose')
+def ruview_pose():
+    data, code = _ruview_get('/api/v1/pose/current')
+    return jsonify(data), code
+
+
+@app.route('/api/ruview/vitals')
+def ruview_vitals():
+    data, code = _ruview_get('/api/v1/vital-signs')
+    return jsonify(data), code
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────

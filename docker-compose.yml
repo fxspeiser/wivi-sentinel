@@ -1,0 +1,30 @@
+services:
+
+  # ── Wi-Vi Sentinel ──────────────────────────────────────────────────────────
+  sentinel:
+    build: .
+    container_name: wivi-sentinel
+    restart: unless-stopped
+    ports:
+      - "${FLASK_PORT:-5555}:5555"
+    env_file: .env
+    environment:
+      # Use the internal Docker network to reach RuView — overrides RUVIEW_URL in .env
+      RUVIEW_URL: http://ruview:3000
+    volumes:
+      - ./data:/app/data          # persist profiles.json across restarts
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0 # ESP32 USB serial passthrough
+    depends_on:
+      - ruview
+
+  # ── RuView (WiFi DensePose) ─────────────────────────────────────────────────
+  ruview:
+    image: ruvnet/wifi-densepose:latest
+    container_name: wivi-ruview
+    restart: unless-stopped
+    ports:
+      - "${RUVIEW_PORT:-3100}:3000"   # web UI + API reachable from host
+      - "5005:5005/udp"               # ESP32 CSI UDP (if RuView ever reads ESP32 directly)
+    environment:
+      CSI_SOURCE: ${RUVIEW_CSI_SOURCE:-simulated}

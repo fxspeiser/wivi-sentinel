@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wi-Vi Sentinel — start Flask API + dashboard
+# Wi-Vi Sentinel — start Flask API + dashboard + RuView Docker
 #
 # Usage:
 #   ./start.sh          Auto-detects: Vite dev server if Node >=18, else Flask serves dist/
@@ -19,6 +19,9 @@ fi
 
 FLASK_PORT="${FLASK_PORT:-5555}"
 VITE_PORT="${VITE_PORT:-3000}"
+RUVIEW_PORT="${RUVIEW_PORT:-3100}"
+RUVIEW_ENABLED="${RUVIEW_ENABLED:-true}"
+RUVIEW_CONTAINER="wivi-ruview"
 MODE="${1:-auto}"
 
 # ── Activate Python venv if present ──
@@ -44,18 +47,69 @@ if [ "$MODE" = "auto" ]; then
     fi
 fi
 
+# ── RuView Docker ─────────────────────────────────────────────────────────────
+RUVIEW_PID=""
+
+start_ruview() {
+    if [ "$RUVIEW_ENABLED" != "true" ]; then
+        echo "[RuView] Disabled (RUVIEW_ENABLED=false)"
+        return
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        echo "[RuView] Docker not found — skipping RuView"
+        echo "[RuView] Install Docker and rerun to enable pose estimation"
+        return
+    fi
+
+    # Stop any stale container with the same name
+    if docker ps -a --format '{{.Names}}' | grep -q "^${RUVIEW_CONTAINER}$"; then
+        echo "[RuView] Removing stale container '${RUVIEW_CONTAINER}'..."
+        docker rm -f "$RUVIEW_CONTAINER" &>/dev/null || true
+    fi
+
+    # Determine the CSI source for RuView — run simulated alongside esp32/nexmon
+    RUVIEW_CSI="${RUVIEW_CSI_SOURCE:-simulated}"
+
+    echo "[RuView] Starting Docker container on :${RUVIEW_PORT} (CSI_SOURCE=${RUVIEW_CSI})..."
+    docker run -d \
+        --name "$RUVIEW_CONTAINER" \
+        -p "${RUVIEW_PORT}:3000" \
+        -p "$((RUVIEW_PORT + 1)):3001" \
+        -p "5005:5005/udp" \
+        -e "CSI_SOURCE=${RUVIEW_CSI}" \
+        ruvnet/wifi-densepose:latest \
+        &>/dev/null
+
+    # Give it a moment to start, then verify
+    sleep 2
+    if docker ps --format '{{.Names}}' | grep -q "^${RUVIEW_CONTAINER}$"; then
+        echo "[RuView] Running → http://localhost:${RUVIEW_PORT}/ui/observatory.html"
+    else
+        echo "[RuView] Container failed to start — check: docker logs ${RUVIEW_CONTAINER}"
+    fi
+}
+
+start_ruview
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
     echo ""
     echo "Shutting down..."
-    [ -n "$VITE_PID" ] && kill $VITE_PID 2>/dev/null
-    [ -n "$FLASK_PID" ] && kill $FLASK_PID 2>/dev/null
+    [ -n "$VITE_PID" ]  && kill "$VITE_PID"  2>/dev/null
+    [ -n "$FLASK_PID" ] && kill "$FLASK_PID" 2>/dev/null
+    if docker ps --format '{{.Names}}' | grep -q "^${RUVIEW_CONTAINER}$" 2>/dev/null; then
+        echo "[RuView] Stopping container..."
+        docker stop "$RUVIEW_CONTAINER" &>/dev/null || true
+        docker rm   "$RUVIEW_CONTAINER" &>/dev/null || true
+    fi
     wait 2>/dev/null
     exit 0
 }
 trap cleanup INT TERM
 
+# ── Start servers ─────────────────────────────────────────────────────────────
 if [ "$MODE" = "dev" ]; then
-    # ── Dev mode: Flask API + Vite dev server with hot-reload ──
     echo "[Flask]  Starting API server on :${FLASK_PORT}"
     python3 server.py &
     FLASK_PID=$!
@@ -65,14 +119,15 @@ if [ "$MODE" = "dev" ]; then
     VITE_PID=$!
 
     echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Wi-Vi Sentinel running (dev mode)"
-    echo "  Dashboard:  http://localhost:${VITE_PORT}"
-    echo "  API:        http://localhost:${FLASK_PORT}"
-    echo "  Press Ctrl+C to stop"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Dashboard:   http://localhost:${VITE_PORT}"
+    echo "  API:         http://localhost:${FLASK_PORT}"
+    [ "$RUVIEW_ENABLED" = "true" ] && \
+    echo "  RuView:      http://localhost:${RUVIEW_PORT}/ui/observatory.html"
+    echo "  Press Ctrl+C to stop all services"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 else
-    # ── Production mode: Flask serves everything ──
     if [ ! -f dist/index.html ]; then
         echo "[WARN]   dist/index.html not found."
         echo "         Run './start.sh build' on a machine with Node >=18,"
@@ -85,11 +140,13 @@ else
     FLASK_PID=$!
 
     echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Wi-Vi Sentinel running (production)"
     echo "  Dashboard + API:  http://localhost:${FLASK_PORT}"
-    echo "  Press Ctrl+C to stop"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    [ "$RUVIEW_ENABLED" = "true" ] && \
+    echo "  RuView:           http://localhost:${RUVIEW_PORT}/ui/observatory.html"
+    echo "  Press Ctrl+C to stop all services"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 
 echo ""
