@@ -388,7 +388,7 @@ function RadarCanvas({ size, profiles, active, sweepAngle, pingTimes, selectedId
 // Compact sidebar widget (150 px) that expands into a 400 px modal on click.
 // Click any dot in expanded mode to inspect that signature's profile data.
 
-function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, onPoseView, newIds }) {
+function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest }) {
   const t = useContext(ThemeContext);
   const [expanded, setExpanded] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
@@ -695,19 +695,6 @@ function RadarDisplay({ profiles, active, onTag, onDelete, onSuggest, onPoseView
                     </div>
                   )}
 
-                  {/* Pose View button — human only */}
-                  {sm.species === 'human' && onPoseView && (
-                    <button
-                      onClick={() => { onPoseView(selectedProfile.id); }}
-                      style={{
-                        width: '100%', marginTop: 4, padding: '5px 0',
-                        background: 'rgba(167,139,250,0.1)', border: '1px solid rgba(167,139,250,0.35)',
-                        color: '#a78bfa', borderRadius: 5, cursor: 'pointer', fontSize: 10,
-                        fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: '0.08em',
-                      }}
-                    >◈ POSE VIEW</button>
-                  )}
-
                   {/* Tag button — opens inline editor */}
                   {!selectedProfile.nickname && onTag && !editingTag && (
                     <button
@@ -778,285 +765,9 @@ function Badge({ label, color, bg, icon, glow }) {
   );
 }
 
-// ─── Pose View Modal (RuView integration) ────────────────────────────────────
-// Polls /api/ruview/pose and /api/ruview/vitals to render a live 17-keypoint
-// skeleton. Falls back to an Observatory iframe or a setup guide when RuView
-// is unreachable.
-
-const COCO_CONNECTIONS = [
-  [0,1],[0,2],[1,3],[2,4],         // face
-  [5,6],[5,7],[7,9],[6,8],[8,10],  // arms
-  [5,11],[6,12],[11,12],           // torso
-  [11,13],[13,15],[12,14],[14,16], // legs
-];
-const COCO_NAMES = ['nose','l_eye','r_eye','l_ear','r_ear','l_shldr','r_shldr','l_elbow','r_elbow','l_wrist','r_wrist','l_hip','r_hip','l_knee','r_knee','l_ank','r_ank'];
-
-function SkeletonCanvas({ keypoints, width = 280, height = 420 }) {
-  const t = useContext(ThemeContext);
-  const ref = useRef(null);
-
-  useEffect(() => {
-    const c = ref.current;
-    if (!c) return;
-    const ctx = c.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    c.width = width * dpr; c.height = height * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, width, height);
-
-    if (!keypoints || keypoints.length < 17) {
-      ctx.fillStyle = t.textDim;
-      ctx.font = '11px "JetBrains Mono", monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('NO POSE DATA', width / 2, height / 2);
-      return;
-    }
-
-    // Normalise coordinates to canvas — RuView may return [0,1] or pixel values
-    const xs = keypoints.map(k => k.x ?? k[0] ?? 0);
-    const ys = keypoints.map(k => k.y ?? k[1] ?? 0);
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-    const rangeX = (maxX - minX) || 1, rangeY = (maxY - minY) || 1;
-    const pad = 36;
-    const toCanvas = (k) => ({
-      x: pad + ((k.x ?? k[0] ?? 0) - minX) / rangeX * (width - pad * 2),
-      y: pad + ((k.y ?? k[1] ?? 0) - minY) / rangeY * (height - pad * 2),
-      conf: k.confidence ?? k[3] ?? 1,
-    });
-    const pts = keypoints.map(toCanvas);
-
-    // Draw connections
-    COCO_CONNECTIONS.forEach(([a, b]) => {
-      const pa = pts[a], pb = pts[b];
-      if (!pa || !pb || pa.conf < 0.2 || pb.conf < 0.2) return;
-      const alpha = Math.min(pa.conf, pb.conf);
-      ctx.beginPath();
-      ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
-      ctx.strokeStyle = `rgba(167,139,250,${alpha * 0.85})`;
-      ctx.lineWidth = 2.5;
-      ctx.shadowColor = '#a78bfa'; ctx.shadowBlur = 5;
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-    });
-
-    // Draw joints
-    pts.forEach((p, i) => {
-      if (p.conf < 0.2) return;
-      const r = i < 5 ? 5 : 4; // head joints slightly larger
-      const grad = ctx.createRadialGradient(p.x - r * 0.3, p.y - r * 0.3, 0, p.x, p.y, r);
-      grad.addColorStop(0, 'rgba(255,255,255,0.9)');
-      grad.addColorStop(1, `rgba(167,139,250,${p.conf})`);
-      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = grad;
-      ctx.shadowColor = '#a78bfa'; ctx.shadowBlur = 8;
-      ctx.fill(); ctx.shadowBlur = 0;
-    });
-  }, [keypoints, width, height, t]);
-
-  return <canvas ref={ref} style={{ width, height, display: 'block' }} />;
-}
-
-function PoseViewModal({ profile, ruviewUrl, onClose }) {
-  const t = useContext(ThemeContext);
-  const [tab, setTab] = useState('skeleton');
-  const [pose, setPose] = useState(null);
-  const [vitals, setVitals] = useState(null);
-  const [reachable, setReachable] = useState(null); // null=checking, true, false
-  const pollRef = useRef(null);
-
-  const m = profile?.metadata || {};
-  const baseUrl = ruviewUrl || 'http://localhost:3000';
-
-  useEffect(() => {
-    let cancelled = false;
-    const poll = async () => {
-      try {
-        const [pr, vr] = await Promise.all([
-          fetch(`${API}/ruview/pose`),
-          fetch(`${API}/ruview/vitals`),
-        ]);
-        if (cancelled) return;
-        if (pr.ok) {
-          setPose(await pr.json());
-          setReachable(true);
-        } else {
-          setReachable(false);
-        }
-        if (vr.ok) setVitals(await vr.json());
-      } catch {
-        if (!cancelled) setReachable(false);
-      }
-    };
-    poll();
-    pollRef.current = setInterval(poll, 300);
-    return () => { cancelled = true; clearInterval(pollRef.current); };
-  }, []);
-
-  // Close on ESC
-  useEffect(() => {
-    const h = (e) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', h);
-    return () => document.removeEventListener('keydown', h);
-  }, [onClose]);
-
-  const kps = pose?.keypoints ?? pose?.pose ?? null;
-
-  return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.88)',
-        backdropFilter: 'blur(8px)', zIndex: 400,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}
-    >
-      <div
-        onClick={e => e.stopPropagation()}
-        style={{
-          background: t.bgCard,
-          border: `1px solid rgba(167,139,250,0.35)`,
-          borderRadius: 14, padding: 24, width: 660, maxWidth: '96vw',
-          boxShadow: '0 0 60px rgba(167,139,250,0.18), 0 0 120px rgba(167,139,250,0.08)',
-          display: 'flex', flexDirection: 'column', gap: 0, maxHeight: '90vh', overflow: 'hidden',
-        }}
-      >
-        {/* Header */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <div>
-            <span style={{ fontSize: 13, fontWeight: 800, color: '#a78bfa', letterSpacing: '0.12em' }}>◈ RUVIEW POSE ESTIMATION</span>
-            <span style={{ fontSize: 10, color: t.textSecondary, marginLeft: 12 }}>
-              {profile?.nickname || profile?.id?.slice(0, 10) || '—'} · {m.species?.toUpperCase() || '?'} · {m.sex_estimation?.toUpperCase() || ''}
-            </span>
-          </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {reachable !== null && (
-              <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.08em',
-                color: reachable ? '#00ff87' : '#ef4444' }}>
-                {reachable ? '● LIVE' : '● OFFLINE'}
-              </span>
-            )}
-            <button onClick={onClose} style={{
-              background: 'transparent', border: `1px solid ${t.border}`,
-              color: t.textMuted, borderRadius: 5, padding: '3px 10px',
-              cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700,
-            }}>ESC</button>
-          </div>
-        </div>
-
-        {/* Tab bar */}
-        <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
-          {[['skeleton','SKELETON'],['observatory','OBSERVATORY'],['setup','SETUP']].map(([k, l]) => (
-            <button key={k} onClick={() => setTab(k)} style={{
-              padding: '5px 14px', borderRadius: 4, cursor: 'pointer',
-              background: tab === k ? 'rgba(167,139,250,0.12)' : 'transparent',
-              border: tab === k ? '1px solid rgba(167,139,250,0.4)' : `1px solid ${t.border}`,
-              color: tab === k ? '#a78bfa' : t.textSecondary,
-              fontSize: 10, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: '0.1em',
-            }}>{l}</button>
-          ))}
-        </div>
-
-        {/* Skeleton tab */}
-        {tab === 'skeleton' && (
-          <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
-            <div style={{
-              background: t.bgSidebar, borderRadius: 10,
-              border: `1px solid rgba(167,139,250,0.2)`,
-              padding: 12, flexShrink: 0,
-            }}>
-              <SkeletonCanvas keypoints={kps} width={280} height={420} />
-            </div>
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {/* Vitals from RuView */}
-              {vitals && (
-                <div style={{ background: t.bgSidebar, borderRadius: 8, padding: 14, border: `1px solid rgba(167,139,250,0.2)` }}>
-                  <div style={{ fontSize: 9, color: '#a78bfa', fontWeight: 700, letterSpacing: '0.12em', marginBottom: 10 }}>RUVIEW VITALS</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 12 }}>
-                    {vitals.heart_rate != null && (
-                      <div><span style={{ color: t.textSecondary }}>HEART </span><span style={{ color: '#ff3e6c', fontWeight: 800 }}>{Math.round(vitals.heart_rate)} bpm</span></div>
-                    )}
-                    {vitals.breathing_rate != null && (
-                      <div><span style={{ color: t.textSecondary }}>BREATH </span><span style={{ color: '#00b4d8', fontWeight: 800 }}>{Math.round(vitals.breathing_rate)}/m</span></div>
-                    )}
-                    {vitals.confidence != null && (
-                      <div style={{ gridColumn: '1/-1' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
-                          <span style={{ color: t.textSecondary, fontSize: 9 }}>CONFIDENCE</span>
-                          <span style={{ color: '#a78bfa', fontSize: 10, fontWeight: 700 }}>{(vitals.confidence * 100).toFixed(0)}%</span>
-                        </div>
-                        <div style={{ height: 3, background: t.bgProgress, borderRadius: 2 }}>
-                          <div style={{ height: '100%', width: `${vitals.confidence * 100}%`, background: '#a78bfa', borderRadius: 2 }} />
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-              {/* Wi-Vi profile vitals (from our own system) */}
-              <div style={{ background: t.bgSidebar, borderRadius: 8, padding: 14, border: `1px solid ${t.border}` }}>
-                <div style={{ fontSize: 9, color: t.textSecondary, fontWeight: 700, letterSpacing: '0.12em', marginBottom: 10 }}>WI-VI READINGS</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 12 }}>
-                  {m.bpm != null && <div><span style={{ color: t.textSecondary }}>BPM </span><span style={{ color: '#ff3e6c', fontWeight: 700 }}>{m.bpm}</span></div>}
-                  {m.respiratory_rate != null && <div><span style={{ color: t.textSecondary }}>RESP </span><span style={{ color: t.textPrimary, fontWeight: 700 }}>{m.respiratory_rate}/m</span></div>}
-                  {m.cadence_spm != null && <div><span style={{ color: t.textSecondary }}>CADENCE </span><span style={{ color: '#00b4d8', fontWeight: 700 }}>{m.cadence_spm} spm</span></div>}
-                  {m.distance_m != null && <div><span style={{ color: t.textSecondary }}>DIST </span><span style={{ color: dirColor(m.direction), fontWeight: 700 }}>~{m.distance_m}m</span></div>}
-                </div>
-              </div>
-              {!reachable && reachable !== null && (
-                <div style={{ background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 8, padding: 12, fontSize: 10, color: '#ef4444', fontWeight: 600, lineHeight: 1.6 }}>
-                  RuView unreachable at {baseUrl}.<br/>
-                  Switch to SETUP tab for Docker instructions.
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Observatory tab */}
-        {tab === 'observatory' && (
-          <iframe
-            src={`${baseUrl}/ui/observatory.html`}
-            style={{ width: '100%', height: 500, border: 'none', borderRadius: 8, background: '#000' }}
-            title="RuView Observatory"
-          />
-        )}
-
-        {/* Setup tab */}
-        {tab === 'setup' && (
-          <div style={{ fontSize: 11, color: t.textSecondary, lineHeight: 1.8, fontFamily: "'JetBrains Mono', monospace" }}>
-            <div style={{ color: '#a78bfa', fontWeight: 800, fontSize: 12, marginBottom: 12 }}>RUVIEW DOCKER SETUP</div>
-            <p style={{ marginBottom: 8, color: t.textMid }}>Run on the Pi (or any machine on the same network):</p>
-            {[
-              'docker pull ruvnet/wifi-densepose:latest',
-              'docker run -p 3000:3000 -p 3001:3001 -p 5005:5005/udp \\',
-              '  -e CSI_SOURCE=simulated \\',
-              '  ruvnet/wifi-densepose:latest',
-            ].map((line, i) => (
-              <div key={i} style={{
-                background: t.bgSidebar, border: `1px solid ${t.border}`, borderRadius: 4,
-                padding: '4px 10px', marginBottom: 2, color: t.green, fontSize: 10, whiteSpace: 'pre',
-              }}>{line}</div>
-            ))}
-            <p style={{ marginTop: 12, color: t.textMid }}>
-              Then set <span style={{ color: '#a78bfa' }}>RUVIEW_URL=http://&lt;pi-ip&gt;:3000</span> in
-              your <span style={{ color: t.textPrimary }}>wivi-sentinel/.env</span> and restart server.py.
-            </p>
-            <p style={{ marginTop: 8, color: t.textMuted, fontSize: 10 }}>
-              Current URL: <span style={{ color: t.textPrimary }}>{baseUrl}</span>
-              {reachable === true && <span style={{ color: '#00ff87', marginLeft: 8 }}>● REACHABLE</span>}
-              {reachable === false && <span style={{ color: '#ef4444', marginLeft: 8 }}>● NOT REACHABLE</span>}
-            </p>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 // ─── Profile Card ────────────────────────────────────────────────────────────
 
-function ProfileCard({ profile, onTag, onDelete, onSuggest, onPoseView, isNew }) {
+function ProfileCard({ profile, onTag, onDelete, onSuggest, isNew }) {
   const t = useContext(ThemeContext);
   const [editing, setEditing] = useState(false);
   const [nickname, setNickname] = useState(profile.nickname || "");
@@ -1243,18 +954,6 @@ function ProfileCard({ profile, onTag, onDelete, onSuggest, onPoseView, isNew })
         FIRST {new Date(profile.first_seen).toLocaleString()}
       </div>
 
-      {m.species === "human" && onPoseView && (
-        <button
-          onClick={() => onPoseView(profile.id)}
-          style={{
-            marginTop: 10, width: "100%", padding: "6px 0",
-            background: "rgba(167,139,250,0.1)", border: "1px solid rgba(167,139,250,0.35)",
-            color: "#a78bfa", borderRadius: 5, cursor: "pointer", fontSize: 10,
-            fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: "0.1em",
-          }}
-        >◈ POSE VIEW</button>
-      )}
-
       <button onClick={handleDelete} style={{
         position: "absolute", top: 10, right: 10,
         background: confirmDelete ? "#ef444433" : "transparent",
@@ -1388,69 +1087,6 @@ function FilterBtn({ label, active, color, count, onClick }) {
   );
 }
 
-// ─── RuView Sidebar Widget ───────────────────────────────────────────────────
-
-function RuViewSidebar({ ruviewUrl }) {
-  const t = useContext(ThemeContext);
-  const [open, setOpen] = useState(false);
-  const [reachable, setReachable] = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const check = async () => {
-      try {
-        const r = await fetch(`${API}/ruview/status`);
-        const d = await r.json();
-        if (!cancelled) setReachable(d.reachable === true);
-      } catch { if (!cancelled) setReachable(false); }
-    };
-    check();
-    const id = setInterval(check, 10000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, []);
-
-  const dotColor = reachable === null ? '#64748b' : reachable ? '#00ff87' : '#ef4444';
-  const dotLabel = reachable === null ? 'CHECKING' : reachable ? 'LIVE' : 'OFFLINE';
-
-  return (
-    <div>
-      <div
-        onClick={() => setOpen(o => !o)}
-        style={{
-          fontSize: 9, color: t.textMid, letterSpacing: '0.15em', fontWeight: 700,
-          marginBottom: 6, paddingBottom: 5, borderBottom: `1px solid ${t.border}`,
-          cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        }}
-      >
-        <span style={{ color: '#a78bfa' }}>◈ RUVIEW</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, display: 'inline-block', boxShadow: reachable ? `0 0 6px ${dotColor}` : 'none' }} />
-          <span style={{ fontSize: 8, color: dotColor, fontWeight: 700 }}>{dotLabel}</span>
-          <span style={{ fontSize: 11, transform: open ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s' }}>&#9654;</span>
-        </div>
-      </div>
-      {open && (
-        <div style={{ fontSize: 9, color: t.textSecondary, lineHeight: 1.7 }}>
-          <div style={{ marginBottom: 4 }}>
-            <span style={{ color: t.textMuted }}>URL </span>
-            <span style={{ color: t.textMid }}>{ruviewUrl || 'http://localhost:3000'}</span>
-          </div>
-          <div style={{ color: t.textMuted, lineHeight: 1.6 }}>
-            Click <span style={{ color: '#a78bfa', fontWeight: 700 }}>◈ POSE VIEW</span> on any human card to open the pose viewer.
-          </div>
-          {!reachable && reachable !== null && (
-            <div style={{ marginTop: 6, color: '#ef4444', fontWeight: 600 }}>
-              Start RuView:<br />
-              <span style={{ color: t.textMid, fontFamily: "'JetBrains Mono', monospace", fontSize: 8 }}>
-                docker run -p 3000:3000 ruvnet/wifi-densepose:latest
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -1473,7 +1109,6 @@ export default function App() {
   const [wifiSaving, setWifiSaving] = useState(false);
   const [wifiMsg, setWifiMsg]       = useState(null);
   const [wifiStatus, setWifiStatus] = useState(null);
-  const [poseViewId, setPoseViewId] = useState(null);
 
   const t = darkMode ? THEMES.dark : THEMES.light;
 
@@ -1625,7 +1260,7 @@ export default function App() {
 
         <div style={{ display: "grid", gridTemplateColumns: "210px 1fr", minHeight: "calc(100vh - 56px)" }}>
           <aside style={{ borderRight: `1px solid ${t.border}`, padding: 14, display: "flex", flexDirection: "column", gap: 16, background: t.bgSidebar }}>
-            <div style={{ display: "flex", justifyContent: "center" }}><RadarDisplay profiles={profiles} active={connected} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} onPoseView={setPoseViewId} newIds={newIds} /></div>
+            <div style={{ display: "flex", justifyContent: "center" }}><RadarDisplay profiles={profiles} active={connected} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} /></div>
 
             <div style={{ fontSize: 10 }}>
               <SectionLabel>SYSTEM</SectionLabel>
@@ -1757,8 +1392,6 @@ export default function App() {
               </div>
             )}
 
-            <RuViewSidebar ruviewUrl={status?.ruview_url} />
-
             <div style={{ flex: 1 }}>
               <SectionLabel>LIVE FEED</SectionLabel>
               <EventFeed events={history} />
@@ -1818,7 +1451,7 @@ export default function App() {
             ) : (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))", gap: 12 }}>
                 {filtered.map(p => (
-                  <ProfileCard key={p.id} profile={p} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} onPoseView={setPoseViewId} isNew={newIds.has(p.id)} />
+                  <ProfileCard key={p.id} profile={p} onTag={handleTag} onDelete={handleDelete} onSuggest={handleSuggest} isNew={newIds.has(p.id)} />
                 ))}
               </div>
             )}
@@ -1829,13 +1462,6 @@ export default function App() {
         </div>
       </div>
 
-      {poseViewId && (
-        <PoseViewModal
-          profile={profiles.find(p => p.id === poseViewId)}
-          ruviewUrl={status?.ruview_url}
-          onClose={() => setPoseViewId(null)}
-        />
-      )}
     </ThemeContext.Provider>
   );
 }

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Wi-Vi Sentinel — start Flask API + dashboard + RuView Docker
+# Wi-Vi Sentinel — unified start / control script
 #
-# Usage:
-#   ./start.sh          Auto-detects: Vite dev server if Node >=18, else Flask serves dist/
-#   ./start.sh dev      Force Vite dev mode (hot-reload, requires Node >=18)
-#   ./start.sh prod     Force production mode (Flask serves pre-built dist/)
-#   ./start.sh build    Build the dashboard (run on Mac, then deploy dist/ to Pi)
+# On the Pi (systemd installed):
+#   ./start.sh              start via systemd (or direct if unit missing)
+#   ./start.sh restart      sudo systemctl restart wivi-sentinel
+#   ./start.sh stop         sudo systemctl stop wivi-sentinel
+#   ./start.sh status       systemctl status wivi-sentinel
+#   ./start.sh logs         journalctl -u wivi-sentinel -f
+#
+# On Mac / dev machines (no systemd):
+#   ./start.sh dev          Flask API + Vite hot-reload (requires Node >=18)
+#   ./start.sh build        Build dist/ only (run on Mac, rsync to Pi)
+#
+# Auto-detect: if systemd unit exists → use systemctl; else → direct process
 
 set -e
 
@@ -19,97 +26,62 @@ fi
 
 FLASK_PORT="${FLASK_PORT:-5555}"
 VITE_PORT="${VITE_PORT:-3000}"
-RUVIEW_PORT="${RUVIEW_PORT:-3100}"
-RUVIEW_ENABLED="${RUVIEW_ENABLED:-true}"
-RUVIEW_CONTAINER="wivi-ruview"
 MODE="${1:-auto}"
 
-# ── Activate Python venv if present ──
-if [ -f venv/bin/activate ]; then
-    source venv/bin/activate
+# ── Helper: does the systemd unit exist? ──────────────────────────────────────
+_has_systemd_unit() {
+    systemctl list-unit-files wivi-sentinel.service &>/dev/null 2>&1 && \
+    systemctl list-unit-files wivi-sentinel.service | grep -q "wivi-sentinel"
+}
+
+# ── Explicit control commands ─────────────────────────────────────────────────
+
+if [ "$MODE" = "restart" ]; then
+    echo "[systemd] Restarting wivi-sentinel..."
+    sudo systemctl restart wivi-sentinel
+    sleep 1
+    systemctl is-active wivi-sentinel && echo "[systemd] Running." || echo "[systemd] Failed — check: journalctl -u wivi-sentinel -n 30"
+    exit $?
 fi
 
-# ── Build mode: just build and exit ──
+if [ "$MODE" = "stop" ]; then
+    echo "[systemd] Stopping wivi-sentinel..."
+    sudo systemctl stop wivi-sentinel
+    echo "[systemd] Stopped."
+    exit 0
+fi
+
+if [ "$MODE" = "status" ]; then
+    systemctl status wivi-sentinel
+    exit $?
+fi
+
+if [ "$MODE" = "logs" ]; then
+    journalctl -u wivi-sentinel -f
+    exit 0
+fi
+
+# ── Build mode ────────────────────────────────────────────────────────────────
 if [ "$MODE" = "build" ]; then
     echo "[Build]  Building dashboard into dist/..."
     npm run build
-    echo "[Build]  Done. Deploy dist/ to your Pi."
+    echo "[Build]  Done. Deploy dist/ to your Pi:"
+    echo "         rsync -av dist/ <user>@<pi-ip>:~/wivi-sentinel/dist/"
     exit 0
 fi
 
-# ── Auto-detect: can we run Vite? ──
-if [ "$MODE" = "auto" ]; then
-    NODE_VER=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
-    if [ -n "$NODE_VER" ] && [ "$NODE_VER" -ge 18 ] 2>/dev/null; then
-        MODE="dev"
-    else
-        MODE="prod"
-    fi
-fi
-
-# ── RuView Docker ─────────────────────────────────────────────────────────────
-RUVIEW_PID=""
-
-start_ruview() {
-    if [ "$RUVIEW_ENABLED" != "true" ]; then
-        echo "[RuView] Disabled (RUVIEW_ENABLED=false)"
-        return
-    fi
-
-    if ! command -v docker &>/dev/null; then
-        echo "[RuView] Docker not found — skipping RuView"
-        echo "[RuView] Install Docker and rerun to enable pose estimation"
-        return
-    fi
-
-    # Stop any stale container with the same name
-    if docker ps -a --format '{{.Names}}' | grep -q "^${RUVIEW_CONTAINER}$"; then
-        echo "[RuView] Removing stale container '${RUVIEW_CONTAINER}'..."
-        docker rm -f "$RUVIEW_CONTAINER" &>/dev/null || true
-    fi
-
-    # Determine the CSI source for RuView — run simulated alongside esp32/nexmon
-    RUVIEW_CSI="${RUVIEW_CSI_SOURCE:-simulated}"
-
-    echo "[RuView] Starting Docker container on :${RUVIEW_PORT} (CSI_SOURCE=${RUVIEW_CSI})..."
-    docker run -d \
-        --name "$RUVIEW_CONTAINER" \
-        -p "${RUVIEW_PORT}:3000" \
-        -p "$((RUVIEW_PORT + 1)):3001" \
-        -p "5005:5005/udp" \
-        -e "CSI_SOURCE=${RUVIEW_CSI}" \
-        ruvnet/wifi-densepose:latest \
-        &>/dev/null
-
-    # Give it a moment to start, then verify
-    sleep 2
-    if docker ps --format '{{.Names}}' | grep -q "^${RUVIEW_CONTAINER}$"; then
-        echo "[RuView] Running → http://localhost:${RUVIEW_PORT}/ui/observatory.html"
-    else
-        echo "[RuView] Container failed to start — check: docker logs ${RUVIEW_CONTAINER}"
-    fi
-}
-
-start_ruview
-
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-cleanup() {
-    echo ""
-    echo "Shutting down..."
-    [ -n "$VITE_PID" ]  && kill "$VITE_PID"  2>/dev/null
-    [ -n "$FLASK_PID" ] && kill "$FLASK_PID" 2>/dev/null
-    if docker ps --format '{{.Names}}' | grep -q "^${RUVIEW_CONTAINER}$" 2>/dev/null; then
-        echo "[RuView] Stopping container..."
-        docker stop "$RUVIEW_CONTAINER" &>/dev/null || true
-        docker rm   "$RUVIEW_CONTAINER" &>/dev/null || true
-    fi
-    wait 2>/dev/null
-    exit 0
-}
-trap cleanup INT TERM
-
-# ── Start servers ─────────────────────────────────────────────────────────────
+# ── Dev mode (Mac / machines with Node >=18) ──────────────────────────────────
 if [ "$MODE" = "dev" ]; then
+    if [ -f venv/bin/activate ]; then source venv/bin/activate; fi
+
+    cleanup() {
+        echo ""; echo "Shutting down..."
+        [ -n "$VITE_PID" ]  && kill "$VITE_PID"  2>/dev/null
+        [ -n "$FLASK_PID" ] && kill "$FLASK_PID" 2>/dev/null
+        wait 2>/dev/null; exit 0
+    }
+    trap cleanup INT TERM
+
     echo "[Flask]  Starting API server on :${FLASK_PORT}"
     python3 server.py &
     FLASK_PID=$!
@@ -120,34 +92,66 @@ if [ "$MODE" = "dev" ]; then
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Wi-Vi Sentinel running (dev mode)"
-    echo "  Dashboard:   http://localhost:${VITE_PORT}"
-    echo "  API:         http://localhost:${FLASK_PORT}"
-    [ "$RUVIEW_ENABLED" = "true" ] && \
-    echo "  RuView:      http://localhost:${RUVIEW_PORT}/ui/observatory.html"
-    echo "  Press Ctrl+C to stop all services"
+    echo "  Wi-Vi Sentinel  (dev mode)"
+    echo "  Dashboard:  http://localhost:${VITE_PORT}"
+    echo "  API:        http://localhost:${FLASK_PORT}"
+    echo "  Press Ctrl+C to stop"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-else
-    if [ ! -f dist/index.html ]; then
-        echo "[WARN]   dist/index.html not found."
-        echo "         Run './start.sh build' on a machine with Node >=18,"
-        echo "         then copy the dist/ folder here."
-        exit 1
-    fi
-
-    echo "[Flask]  Starting server on :${FLASK_PORT} (serving pre-built dashboard)"
-    python3 server.py &
-    FLASK_PID=$!
-
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Wi-Vi Sentinel running (production)"
-    echo "  Dashboard + API:  http://localhost:${FLASK_PORT}"
-    [ "$RUVIEW_ENABLED" = "true" ] && \
-    echo "  RuView:           http://localhost:${RUVIEW_PORT}/ui/observatory.html"
-    echo "  Press Ctrl+C to stop all services"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    wait
+    exit 0
 fi
 
+# ── Auto / prod mode: prefer systemd, fall back to direct ─────────────────────
+
+if _has_systemd_unit; then
+    IS_ACTIVE=$(systemctl is-active wivi-sentinel 2>/dev/null || true)
+    if [ "$IS_ACTIVE" = "active" ]; then
+        echo "[systemd] wivi-sentinel is already running — restarting to apply changes..."
+        sudo systemctl restart wivi-sentinel
+    else
+        echo "[systemd] Starting wivi-sentinel..."
+        sudo systemctl start wivi-sentinel
+    fi
+    sleep 1
+    STATUS=$(systemctl is-active wivi-sentinel 2>/dev/null || echo "unknown")
+    PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Wi-Vi Sentinel  (systemd — ${STATUS})"
+    echo "  Dashboard:  http://${PI_IP}:${FLASK_PORT}"
+    echo "  API:        http://${PI_IP}:${FLASK_PORT}/api/status"
+    echo "  Logs:       journalctl -u wivi-sentinel -f"
+    echo "  Stop:       ./start.sh stop"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit 0
+fi
+
+# ── Direct fallback (no systemd unit — Pi without service installed, or Mac) ──
+if [ -f venv/bin/activate ]; then source venv/bin/activate; fi
+
+if [ ! -f dist/index.html ]; then
+    echo "[WARN]   dist/index.html not found."
+    echo "         Run './start.sh build' on a machine with Node >=18,"
+    echo "         then rsync dist/ to this machine."
+    exit 1
+fi
+
+cleanup() {
+    echo ""; echo "Shutting down..."
+    [ -n "$FLASK_PID" ] && kill "$FLASK_PID" 2>/dev/null
+    wait 2>/dev/null; exit 0
+}
+trap cleanup INT TERM
+
+echo "[Flask]  Starting server on :${FLASK_PORT} (serving pre-built dashboard)"
+python3 server.py &
+FLASK_PID=$!
+
+PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
 echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Wi-Vi Sentinel  (direct)"
+echo "  Dashboard:  http://${PI_IP}:${FLASK_PORT}"
+echo "  Press Ctrl+C to stop"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 wait

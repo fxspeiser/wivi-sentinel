@@ -108,25 +108,48 @@ SPECIES_PROFILES = {
     },
 }
 
-# ─── Sex Estimation Thresholds ───────────────────────────────────────────────
-# Based on WiStep (Wang et al. IEEE TMC 2021) and biomechanics literature:
-#   Males:   cadence 100-120 spm, stride 0.70-0.85m, higher body attenuation
-#   Females: cadence 110-130 spm, stride 0.55-0.72m, lower body attenuation
-# Plus cardiac differences: female resting HR tends 2-8 BPM higher
+# ─── Sex Estimation Features ─────────────────────────────────────────────────
+# Sources:
+#   Cadence:          Winter (1991), Oberg et al. (1993), Murray et al. (1964)
+#                     Male free-walking: μ=107 spm (σ=9.5), Female: μ=117 (σ=9.5)
+#   Stride regularity: Moe-Nilssen & Helbostad (2004) — males slightly higher
+#   Body attenuation: CSI signal mass proxy — males average larger body volume
+#   Heart rate:       AHA epidemiology data
+#                     Male resting: μ=71 BPM (σ=11), Female: μ=77 BPM (σ=11)
+#   Respiratory rate: Parkin et al. physiology — male μ=13/min, female μ=15/min (σ=2.5)
+#   Harmonic ratio:   Hamill et al. (1999), WiStep (Wang et al. TMC 2021)
+#                     Captures gait frequency symmetry — male μ=0.62, female μ=0.53
+#
+# Feature weights reflect discriminative power from literature (d-prime):
+#   cadence ~1.05, harmonic_ratio ~0.90, body_attenuation ~0.75, hr ~0.55,
+#   resp_rate ~0.55, stride_regularity ~0.45
 
 SEX_FEATURES = {
     'male': {
-        'cadence_center': 108,
-        'stride_regularity_center': 0.65,
-        'body_attenuation_center': 0.65,  # higher mass = more signal impact
-        'hr_offset': 0,
+        'cadence_center': 107,        'cadence_sigma': 9.5,
+        'stride_regularity_center': 0.63, 'stride_regularity_sigma': 0.11,
+        'body_attenuation_center': 0.62, 'body_attenuation_sigma': 0.16,
+        'hr_center': 71,              'hr_sigma': 11.0,
+        'resp_center': 13.0,          'resp_sigma': 2.5,
+        'harmonic_center': 0.62,      'harmonic_sigma': 0.10,
     },
     'female': {
-        'cadence_center': 118,
-        'stride_regularity_center': 0.60,
-        'body_attenuation_center': 0.45,
-        'hr_offset': 4,  # avg BPM higher
+        'cadence_center': 117,        'cadence_sigma': 9.5,
+        'stride_regularity_center': 0.58, 'stride_regularity_sigma': 0.11,
+        'body_attenuation_center': 0.43, 'body_attenuation_sigma': 0.16,
+        'hr_center': 77,              'hr_sigma': 11.0,
+        'resp_center': 15.0,          'resp_sigma': 2.5,
+        'harmonic_center': 0.53,      'harmonic_sigma': 0.10,
     },
+}
+
+SEX_FEATURE_WEIGHTS = {
+    'cadence':            1.00,  # strongest discriminator (10 spm gap, σ=9.5)
+    'harmonic_ratio':     0.90,  # gait frequency symmetry
+    'body_attenuation':   0.70,  # mass proxy, high individual variance
+    'hr':                 0.55,  # 6 BPM gap, σ=11 — weak but additive
+    'resp':               0.55,  # 2/min gap, σ=2.5 — weak but additive
+    'stride_regularity':  0.45,  # low standalone power, small distribution gap
 }
 
 
@@ -234,80 +257,94 @@ class SpeciesClassifier:
 
 class SexEstimator:
     """
-    Estimates biological sex from WiFi CSI biometric features.
-    Based on WiStep methodology: gait cadence, stride characteristics,
-    body attenuation profile, and resting heart rate differences.
-    
+    Estimates biological sex from WiFi CSI biometric features using a
+    weighted log-likelihood ratio classifier.
+
+    Features and their sources:
+      cadence         — Winter (1991), Oberg et al. (1993): male μ=107, female μ=117 spm
+      harmonic_ratio  — Hamill et al. (1999), WiStep (Wang et al. TMC 2021)
+      body_attenuation — CSI path loss proxy for body mass
+      bpm             — AHA data: male μ=71, female μ=77 BPM
+      respiratory_rate — Parkin et al.: male μ=13, female μ=15 breaths/min
+      stride_regularity — Moe-Nilssen & Helbostad (2004)
+
     Returns probabilistic estimate, not binary classification.
     """
 
     @staticmethod
+    def _llr(value: float, feat: str) -> float:
+        """
+        Log-likelihood ratio: log P(value|female) - log P(value|male).
+        Positive = evidence for female, negative = evidence for male.
+        Uses per-feature sigma stored in SEX_FEATURES.
+        """
+        m = SEX_FEATURES['male']
+        f = SEX_FEATURES['female']
+        sigma = m[f'{feat}_sigma']
+        lp_male   = -0.5 * ((value - m[f'{feat}_center']) / sigma) ** 2
+        lp_female = -0.5 * ((value - f[f'{feat}_center']) / sigma) ** 2
+        return lp_female - lp_male
+
+    @staticmethod
     def estimate(cadence: float, stride_regularity: float,
-                 body_attenuation: float, bpm: float = 0.0) -> dict:
+                 body_attenuation: float, bpm: float = 0.0,
+                 respiratory_rate: float = 0.0,
+                 harmonic_ratio: float = 0.0) -> dict:
         """
         Returns: {estimation: str, male_prob: float, female_prob: float, confidence: float}
         """
-        male_score = 0.0
-        female_score = 0.0
-        feature_count = 0
+        # Weighted log-likelihood accumulator: positive = female evidence
+        llr_sum = 0.0
+        weight_sum = 0.0
 
-        # Cadence analysis (females tend higher cadence at same speed)
-        if cadence > 0:
-            m_cad_dist = abs(cadence - SEX_FEATURES['male']['cadence_center'])
-            f_cad_dist = abs(cadence - SEX_FEATURES['female']['cadence_center'])
-            # Gaussian-like scoring
-            male_score += np.exp(-0.5 * (m_cad_dist / 12.0) ** 2)
-            female_score += np.exp(-0.5 * (f_cad_dist / 12.0) ** 2)
-            feature_count += 1
+        if cadence > 20:
+            llr_sum += SexEstimator._llr(cadence, 'cadence') * SEX_FEATURE_WEIGHTS['cadence']
+            weight_sum += SEX_FEATURE_WEIGHTS['cadence']
 
-        # Stride regularity (males tend higher due to longer legs / more consistent gait)
-        if stride_regularity > 0:
-            m_sr_dist = abs(stride_regularity - SEX_FEATURES['male']['stride_regularity_center'])
-            f_sr_dist = abs(stride_regularity - SEX_FEATURES['female']['stride_regularity_center'])
-            male_score += np.exp(-0.5 * (m_sr_dist / 0.12) ** 2)
-            female_score += np.exp(-0.5 * (f_sr_dist / 0.12) ** 2)
-            feature_count += 1
+        if harmonic_ratio > 0.05:
+            llr_sum += SexEstimator._llr(harmonic_ratio, 'harmonic') * SEX_FEATURE_WEIGHTS['harmonic_ratio']
+            weight_sum += SEX_FEATURE_WEIGHTS['harmonic_ratio']
 
-        # Body attenuation (proxy for body mass - males generally higher)
-        if body_attenuation > 0:
-            m_ba_dist = abs(body_attenuation - SEX_FEATURES['male']['body_attenuation_center'])
-            f_ba_dist = abs(body_attenuation - SEX_FEATURES['female']['body_attenuation_center'])
-            male_score += np.exp(-0.5 * (m_ba_dist / 0.15) ** 2) * 0.8  # lower weight - less reliable
-            female_score += np.exp(-0.5 * (f_ba_dist / 0.15) ** 2) * 0.8
-            feature_count += 1
+        if body_attenuation > 0.05:
+            llr_sum += SexEstimator._llr(body_attenuation, 'body_attenuation') * SEX_FEATURE_WEIGHTS['body_attenuation']
+            weight_sum += SEX_FEATURE_WEIGHTS['body_attenuation']
 
-        # Heart rate offset (females avg ~4 BPM higher at rest)
         if bpm > 40:
-            # Center around population average ~72 BPM
-            male_hr_expected = 70
-            female_hr_expected = 74
-            m_hr_dist = abs(bpm - male_hr_expected)
-            f_hr_dist = abs(bpm - female_hr_expected)
-            male_score += np.exp(-0.5 * (m_hr_dist / 15.0) ** 2) * 0.6
-            female_score += np.exp(-0.5 * (f_hr_dist / 15.0) ** 2) * 0.6
-            feature_count += 1
+            llr_sum += SexEstimator._llr(bpm, 'hr') * SEX_FEATURE_WEIGHTS['hr']
+            weight_sum += SEX_FEATURE_WEIGHTS['hr']
 
-        if feature_count == 0:
+        if respiratory_rate > 5:
+            llr_sum += SexEstimator._llr(respiratory_rate, 'resp') * SEX_FEATURE_WEIGHTS['resp']
+            weight_sum += SEX_FEATURE_WEIGHTS['resp']
+
+        if stride_regularity > 0.05:
+            llr_sum += SexEstimator._llr(stride_regularity, 'stride_regularity') * SEX_FEATURE_WEIGHTS['stride_regularity']
+            weight_sum += SEX_FEATURE_WEIGHTS['stride_regularity']
+
+        if weight_sum == 0:
             return {
-                'estimation': 'unknown',
+                'estimation': 'indeterminate',
                 'male_prob': 0.5,
                 'female_prob': 0.5,
                 'confidence': 0.0,
             }
 
-        # Normalize to probabilities
-        total = male_score + female_score + 1e-10
-        male_prob = male_score / total
-        female_prob = female_score / total
+        # Normalise LLR by total weight, then convert to probability via sigmoid
+        norm_llr = llr_sum / weight_sum
+        female_prob = 1.0 / (1.0 + np.exp(-norm_llr * 2.5))
+        male_prob = 1.0 - female_prob
 
-        # Confidence based on separation and feature count
-        separation = abs(male_prob - female_prob)
-        feature_factor = min(1.0, feature_count / 3.0)
-        confidence = separation * feature_factor
+        # Confidence: how far from the 0.5 decision boundary, scaled by evidence coverage
+        coverage = min(1.0, weight_sum / 4.15)  # 4.15 = sum of all feature weights
+        separation = abs(female_prob - 0.5) * 2.0
+        confidence = separation * coverage
 
-        estimation = 'male' if male_prob > female_prob else 'female'
-        if confidence < 0.15:
+        if confidence < 0.18:
             estimation = 'indeterminate'
+        elif female_prob > male_prob:
+            estimation = 'female'
+        else:
+            estimation = 'male'
 
         return {
             'estimation': estimation,

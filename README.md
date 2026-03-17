@@ -1,7 +1,7 @@
 # Wi-Vi Sentinel
 
 WiFi CSI biometric detection, classification, and tracking.
-Passive through-wall sensing using an ESP32 + Raspberry Pi 4 + optional RuView pose estimation.
+Passive through-wall sensing using an ESP32 + Raspberry Pi 4.
 
 ```
                          WiFi signals (2.4 GHz)
@@ -16,10 +16,8 @@ Passive through-wall sensing using an ESP32 + Raspberry Pi 4 + optional RuView p
   [Raspberry Pi 4] ◄──┘
        │  server.py — signal processing, classification
        │  Species / sex / direction / device correlation
-       │  Optional: RuView (Docker) — 17-keypoint pose estimation
        │
        └──► http://<pi-ip>:5555  (dashboard + API)
-            http://<pi-ip>:3100  (RuView Observatory)
 ```
 
 ---
@@ -29,7 +27,7 @@ Passive through-wall sensing using an ESP32 + Raspberry Pi 4 + optional RuView p
 | Item | Notes |
 |---|---|
 | **ESP32-DevKitC-32E** | CSI capture (~$10). Must be the 32E variant — S3/C6 don't work with this firmware |
-| **Raspberry Pi 4 Model B** | Any RAM size. Runs server, Docker, RuView |
+| **Raspberry Pi 4 Model B** | Any RAM size. Runs server |
 | **USB-A to Micro-USB cable** | Data cable (not charge-only) — connects ESP32 to Pi |
 | **Micro SD card** (16 GB+) | For Pi OS |
 | **USB-C power supply** | For Pi (≥3A recommended) |
@@ -95,7 +93,7 @@ rsync -av dist/ doc@192.168.1.148:~/wivi-sentinel/dist/
 
 ```bash
 # On the Pi:
-wivi-start
+~/wivi-sentinel/start.sh
 ```
 
 Open `http://192.168.1.148:5555` in your browser.
@@ -173,13 +171,11 @@ ssh ${PI_USER}@${PI_IP} "
   export ESP32_SERIAL_PORT=/dev/ttyUSB0
   export ESP32_BAUD_RATE=921600
   export FLASK_PORT=5555
-  export RUVIEW_PORT=3100
-  export RUVIEW_ENABLED=true
   bash ~/setup_pi.sh
 "
 ```
 Expected: script completes with summary banner showing dashboard URL.
-Duration: 3–8 minutes (Docker install + pip install).
+Duration: 2–5 minutes (pip install).
 
 **2.4 Verify Python environment**
 ```bash
@@ -187,12 +183,6 @@ ssh ${PI_USER}@${PI_IP} \
   "~/wivi-sentinel/venv/bin/python3 -c 'import flask, numpy, scipy, serial; print(\"deps OK\")'"
 ```
 Expected: `deps OK`
-
-**2.5 Verify Docker**
-```bash
-ssh ${PI_USER}@${PI_IP} "docker --version && docker ps"
-```
-Expected: Docker version line + running containers list (may include `wivi-ruview`).
 
 ---
 
@@ -236,18 +226,17 @@ If missing: check USB cable (must be data cable), try different USB port.
 
 **4.3 Start all services**
 ```bash
-ssh ${PI_USER}@${PI_IP} "wivi-start"
+ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh"
 ```
-Or via systemd:
-```bash
-ssh ${PI_USER}@${PI_IP} "sudo systemctl start wivi-ruview wivi-sentinel"
-```
+`start.sh` auto-detects the systemd unit. If the unit is installed and already active it
+restarts it; otherwise it starts it. Never spawn `python3 server.py` directly on the Pi
+if the systemd unit is installed — `start.sh` or `systemctl` only.
 
 **4.4 Verify services are running**
 ```bash
 ssh ${PI_USER}@${PI_IP} "wivi-status"
 ```
-Expected: both `sentinel: RUNNING` and `ruview: RUNNING`.
+Expected: `sentinel: RUNNING`.
 
 ---
 
@@ -271,12 +260,7 @@ If zero after 60s:
 - Check ESP32 is on WiFi: `curl http://${PI_IP}:5555/api/esp32/wifi`
 - Check serial: `ssh ${PI_USER}@${PI_IP} "timeout 3 cat /dev/ttyUSB0 | head -5"`
 
-**5.3 RuView health check**
-```bash
-curl -sf "http://${PI_IP}:3100/health" || echo "RuView not yet ready (may still be starting)"
-```
-
-**5.4 Open dashboard**
+**5.3 Open dashboard**
 ```
 http://${PI_IP}:5555
 ```
@@ -292,7 +276,7 @@ When code changes on the Mac, run this to update the Pi and rebuild:
 npm run build && \
 rsync -av --exclude node_modules --exclude .git --exclude venv --exclude data \
   ./ ${PI_USER}@${PI_IP}:~/wivi-sentinel/ && \
-ssh ${PI_USER}@${PI_IP} "sudo systemctl restart wivi-sentinel"
+ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh restart"
 ```
 
 ---
@@ -301,13 +285,13 @@ ssh ${PI_USER}@${PI_IP} "sudo systemctl restart wivi-sentinel"
 
 ```bash
 # Stop everything
-ssh ${PI_USER}@${PI_IP} "wivi-stop"
+ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh stop"
 
 # Clear profiles
 ssh ${PI_USER}@${PI_IP} "echo '{}' > ~/wivi-sentinel/data/profiles.json"
 
 # Restart
-ssh ${PI_USER}@${PI_IP} "wivi-start"
+ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh restart"
 ```
 
 ---
@@ -333,7 +317,7 @@ docker compose logs -f
 docker compose down
 ```
 
-The `docker-compose.yml` passes `/dev/ttyUSB0` into the sentinel container and connects it to the RuView container over the internal Docker network.
+The `docker-compose.yml` passes `/dev/ttyUSB0` into the sentinel container.
 
 > **Note:** If you added your user to the `docker` group during setup, log out and back in before running Docker commands directly. Or prefix with `sudo`.
 
@@ -389,19 +373,22 @@ cp .env.example .env
 | `ESP32_SERIAL_PORT` | `/dev/ttyUSB0` | ESP32 USB serial device |
 | `ESP32_BAUD_RATE` | `921600` | Must match firmware config |
 | `PROBE_IFACE` | _(none)_ | Monitor interface for probe sniffing (`mon0`) |
-| `RUVIEW_PORT` | `3100` | Host port for RuView Docker container |
-| `RUVIEW_URL` | `http://localhost:3100` | URL Flask proxies RuView requests to |
-| `RUVIEW_ENABLED` | `true` | Set `false` to skip Docker/RuView entirely |
-| `RUVIEW_CSI_SOURCE` | `simulated` | RuView's own CSI source (usually `simulated`) |
 
 ### `start.sh` modes
 
 ```bash
-./start.sh          # auto: prod if Node <18, dev if Node >=18
-./start.sh prod     # Flask serves pre-built dist/ (Pi)
-./start.sh dev      # Flask API + Vite hot-reload (Mac dev)
+./start.sh          # auto: systemctl if unit installed, else direct process
+./start.sh restart  # sudo systemctl restart wivi-sentinel
+./start.sh stop     # sudo systemctl stop wivi-sentinel
+./start.sh status   # systemctl status wivi-sentinel
+./start.sh logs     # journalctl -u wivi-sentinel -f
+./start.sh dev      # Flask API + Vite hot-reload (Mac dev, requires Node >=18)
 ./start.sh build    # build dist/ only (Mac)
 ```
+
+> On the Pi, `auto` mode auto-detects the installed systemd unit and delegates to
+> `systemctl`. If the unit is not installed it falls back to spawning `python3 server.py`
+> directly (useful during first-time setup or on machines without systemd).
 
 ---
 
@@ -420,9 +407,6 @@ Base URL: `http://<pi-ip>:5555`
 | POST | `/api/devices/suggest` | `{profile_id, device_name}` — suggest association |
 | POST | `/api/esp32/wifi` | `{ssid, password}` — update ESP32 WiFi (reboots) |
 | GET | `/api/esp32/wifi` | Current ESP32 WiFi connection status |
-| GET | `/api/ruview/status` | RuView reachability check |
-| GET | `/api/ruview/pose` | Proxied: RuView 17-keypoint pose |
-| GET | `/api/ruview/vitals` | Proxied: RuView breathing + heart rate |
 | GET | `/api/stream` | Server-sent events (real-time detection stream) |
 
 ---
@@ -436,7 +420,7 @@ wivi-sentinel/
 ├── setup_pi.sh             # Automated Pi deploy + Docker + systemd
 ├── setup_esp32.sh          # ESP32 firmware build + flash
 ├── Dockerfile              # Wi-Vi Sentinel container image
-├── docker-compose.yml      # Full stack: sentinel + ruview
+├── docker-compose.yml      # Docker: sentinel container with ESP32 passthrough
 ├── engine/
 │   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore, coalescing
 │   ├── esp32_source.py     # ESP32 CSI source (USB serial + WiFi config commands)
@@ -446,7 +430,7 @@ wivi-sentinel/
 ├── firmware/
 │   └── csi_recv_router/    # Patched ESP32 firmware (NVS WiFi + UART commands)
 ├── src/                    # Vite/React dashboard source
-│   ├── App.jsx             # Dashboard UI (cards, compact, radar, RuView modal)
+│   ├── App.jsx             # Dashboard UI (cards, compact, radar)
 │   ├── main.jsx
 │   └── index.css
 ├── dist/                   # Vite build output (gitignored — build on Mac, rsync to Pi)
@@ -495,20 +479,6 @@ sudo journalctl -u wivi-sentinel -f
 
 # Low signal: move closer, reduce obstructions, generate WiFi traffic
 ping <router-ip>
-```
-
-### RuView not reachable
-
-```bash
-# Check container status
-docker ps | grep ruview
-docker logs wivi-ruview
-
-# Restart container
-docker restart wivi-ruview
-
-# Check port is exposed
-curl http://localhost:3100/health
 ```
 
 ### Dashboard shows "OFFLINE"

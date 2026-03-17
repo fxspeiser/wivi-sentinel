@@ -19,18 +19,14 @@
 #   export WIVI_DIR="$HOME/wivi-sentinel"
 #   export WIVI_USER="$USER"
 #   export FLASK_PORT=5555
-#   export RUVIEW_PORT=3100
 #   export CSI_SOURCE=esp32
 #   export ESP32_SERIAL_PORT=/dev/ttyUSB0
 #   export ESP32_BAUD_RATE=921600
-#   export RUVIEW_ENABLED=true
 #   ./setup_pi.sh
 #
 # Optional env vars (skip prompts entirely):
 #   WIFI_SSID         — used to update ESP32 WiFi via API after startup
 #   WIFI_PASSWORD     — (same)
-#   RUVIEW_ENABLED    — set false to skip Docker / RuView install
-#   SKIP_DOCKER       — set true to skip Docker install
 #   SKIP_SYSTEMD      — set true to skip systemd service creation
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -54,12 +50,9 @@ WIVI_DIR="${WIVI_DIR:-$HOME/wivi-sentinel}"
 WIVI_USER="${WIVI_USER:-$USER}"
 FLASK_PORT="${FLASK_PORT:-5555}"
 VITE_PORT="${VITE_PORT:-3000}"
-RUVIEW_PORT="${RUVIEW_PORT:-3100}"
 CSI_SOURCE="${CSI_SOURCE:-esp32}"
 ESP32_SERIAL_PORT="${ESP32_SERIAL_PORT:-/dev/ttyUSB0}"
 ESP32_BAUD_RATE="${ESP32_BAUD_RATE:-921600}"
-RUVIEW_ENABLED="${RUVIEW_ENABLED:-true}"
-SKIP_DOCKER="${SKIP_DOCKER:-false}"
 SKIP_SYSTEMD="${SKIP_SYSTEMD:-false}"
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
@@ -102,39 +95,6 @@ sudo apt-get install -y --no-install-recommends \
 sudo systemctl enable --now avahi-daemon 2>/dev/null || true
 
 log "System dependencies installed"
-
-# ── Docker ────────────────────────────────────────────────────────────────────
-
-if [ "$SKIP_DOCKER" != "true" ] && [ "$RUVIEW_ENABLED" = "true" ]; then
-    step "Installing Docker"
-
-    if command -v docker &>/dev/null; then
-        info "Docker already installed: $(docker --version)"
-    else
-        info "Downloading Docker install script..."
-        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-        sudo sh /tmp/get-docker.sh
-        rm -f /tmp/get-docker.sh
-        log "Docker installed"
-    fi
-
-    # Add current user to docker group so we can run without sudo
-    if ! groups "$WIVI_USER" | grep -q docker; then
-        sudo usermod -aG docker "$WIVI_USER"
-        warn "Added $WIVI_USER to docker group — takes effect on next login"
-        warn "If Docker commands fail, log out and back in, then re-run: ./start.sh"
-        # For this session, use sg docker to inherit the group
-        DOCKER_CMD="sg docker -c docker"
-    else
-        DOCKER_CMD="docker"
-    fi
-
-    # Pull RuView image in the background so it's ready when start.sh runs
-    info "Pre-pulling RuView Docker image (background)..."
-    $DOCKER_CMD pull ruvnet/wifi-densepose:latest &>/dev/null &
-    RUVIEW_PULL_PID=$!
-    log "RuView image pull started in background (PID $RUVIEW_PULL_PID)"
-fi
 
 # ── Clone or update repository ────────────────────────────────────────────────
 
@@ -200,15 +160,11 @@ set_env VITE_PORT      "$VITE_PORT"
 set_env CSI_SOURCE     "$CSI_SOURCE"
 set_env ESP32_SERIAL_PORT "$ESP32_SERIAL_PORT"
 set_env ESP32_BAUD_RATE   "$ESP32_BAUD_RATE"
-set_env RUVIEW_PORT    "$RUVIEW_PORT"
-set_env RUVIEW_URL     "http://localhost:${RUVIEW_PORT}"
-set_env RUVIEW_ENABLED "$RUVIEW_ENABLED"
 
 log ".env configured"
 info "  CSI_SOURCE=$CSI_SOURCE"
 info "  ESP32_SERIAL_PORT=$ESP32_SERIAL_PORT"
 info "  FLASK_PORT=$FLASK_PORT"
-info "  RUVIEW_PORT=$RUVIEW_PORT"
 
 # ── ESP32 serial port permissions ─────────────────────────────────────────────
 
@@ -261,9 +217,8 @@ if [ "$SKIP_SYSTEMD" != "true" ]; then
 [Unit]
 Description=Wi-Vi Sentinel — WiFi CSI Biometric Detection
 Documentation=https://github.com/YOUR_USER/wivi-sentinel
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
-Requires=wivi-ruview.service
 
 [Service]
 Type=simple
@@ -282,39 +237,8 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-    if [ "$RUVIEW_ENABLED" = "true" ] && [ "$SKIP_DOCKER" != "true" ]; then
-        sudo tee /etc/systemd/system/wivi-ruview.service > /dev/null << EOF
-[Unit]
-Description=Wi-Vi Sentinel — RuView Pose Estimation (Docker)
-Documentation=https://github.com/ruvnet/RuView
-After=docker.service network-online.target
-Requires=docker.service
-
-[Service]
-Type=simple
-User=${WIVI_USER}
-Restart=on-failure
-RestartSec=10
-ExecStartPre=-/usr/bin/docker rm -f wivi-ruview
-ExecStart=/usr/bin/docker run --rm \
-    --name wivi-ruview \
-    -p ${RUVIEW_PORT}:3000 \
-    -p 5005:5005/udp \
-    -e CSI_SOURCE=simulated \
-    ruvnet/wifi-densepose:latest
-ExecStop=/usr/bin/docker stop wivi-ruview
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        log "Created wivi-ruview.service"
-    fi
-
     sudo systemctl daemon-reload
     sudo systemctl enable wivi-sentinel.service 2>/dev/null || true
-    [ "$RUVIEW_ENABLED" = "true" ] && sudo systemctl enable wivi-ruview.service 2>/dev/null || true
 
     log "Systemd services enabled (start on boot)"
 fi
@@ -325,7 +249,7 @@ step "Installing CLI commands"
 
 sudo tee /usr/local/bin/wivi-start > /dev/null << EOF
 #!/usr/bin/env bash
-# Start Wi-Vi Sentinel (and RuView if enabled)
+# Start Wi-Vi Sentinel
 cd ${WIVI_DIR}
 exec ./start.sh "\$@"
 EOF
@@ -334,8 +258,6 @@ sudo tee /usr/local/bin/wivi-stop > /dev/null << EOF
 #!/usr/bin/env bash
 echo "Stopping Wi-Vi Sentinel..."
 sudo systemctl stop wivi-sentinel 2>/dev/null || true
-sudo systemctl stop wivi-ruview   2>/dev/null || true
-docker stop wivi-ruview 2>/dev/null || true
 echo "Stopped."
 EOF
 
@@ -347,7 +269,6 @@ echo "════════════════════════�
 echo ""
 echo "── Services ──"
 systemctl is-active wivi-sentinel 2>/dev/null && echo "  sentinel: RUNNING" || echo "  sentinel: STOPPED"
-systemctl is-active wivi-ruview   2>/dev/null && echo "  ruview:   RUNNING" || echo "  ruview:   STOPPED"
 echo ""
 echo "── ESP32 ──"
 ls /dev/ttyUSB* 2>/dev/null || echo "  No USB serial devices found"
@@ -357,12 +278,8 @@ PI_IP=\$(hostname -I | awk '{print \$1}')
 echo "  http://\${PI_IP}:${FLASK_PORT}"
 echo "  http://\${PI_IP}:${FLASK_PORT}/api/status"
 echo ""
-echo "── RuView ──"
-echo "  http://\${PI_IP}:${RUVIEW_PORT}/ui/observatory.html"
-echo ""
 echo "── Logs ──"
 echo "  journalctl -u wivi-sentinel -f"
-echo "  journalctl -u wivi-ruview -f"
 STATUSEOF
 
 sudo chmod +x /usr/local/bin/wivi-start \
@@ -370,13 +287,6 @@ sudo chmod +x /usr/local/bin/wivi-start \
               /usr/local/bin/wivi-status
 
 log "Commands installed: wivi-start, wivi-stop, wivi-status"
-
-# ── Wait for RuView image pull (if started) ───────────────────────────────────
-
-if [ -n "${RUVIEW_PULL_PID:-}" ]; then
-    step "Waiting for RuView image pull to complete"
-    wait "$RUVIEW_PULL_PID" && log "RuView image ready" || warn "RuView image pull may have failed — will retry on first start"
-fi
 
 # ── Auto-start ────────────────────────────────────────────────────────────────
 
@@ -386,10 +296,6 @@ if [ "$SKIP_SYSTEMD" = "true" ]; then
     info "SKIP_SYSTEMD=true — not starting services automatically"
     info "Run manually: cd $WIVI_DIR && ./start.sh"
 else
-    if [ "$RUVIEW_ENABLED" = "true" ] && [ "$SKIP_DOCKER" != "true" ]; then
-        sudo systemctl start wivi-ruview 2>/dev/null || warn "wivi-ruview failed to start (check: journalctl -u wivi-ruview)"
-    fi
-
     if [ -f "$WIVI_DIR/dist/index.html" ] || [ -f "$WIVI_DIR/index.legacy.html" ]; then
         sudo systemctl start wivi-sentinel 2>/dev/null || warn "wivi-sentinel failed to start (check: journalctl -u wivi-sentinel)"
     else
@@ -408,8 +314,6 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "  ${BOLD}Dashboard:${NC}  http://${PI_IP}:${FLASK_PORT}"
 echo -e "  ${BOLD}API:${NC}        http://${PI_IP}:${FLASK_PORT}/api/status"
-[ "$RUVIEW_ENABLED" = "true" ] && \
-echo -e "  ${BOLD}RuView:${NC}     http://${PI_IP}:${RUVIEW_PORT}/ui/observatory.html"
 echo ""
 echo -e "  ${YELLOW}CLI Commands:${NC}"
 echo -e "  ${CYAN}wivi-start${NC}   — start all services"
