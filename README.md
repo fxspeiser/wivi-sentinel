@@ -41,6 +41,8 @@ Passive through-wall sensing using an ESP32 + Raspberry Pi 4.
 
 ### Step 1 — Flash the ESP32 (on your Mac or Linux machine, not the Pi)
 
+The ESP32 must be flashed from a machine with a USB port running macOS or Linux (not the Pi itself).
+
 ```bash
 chmod +x setup_esp32.sh
 
@@ -62,15 +64,25 @@ Use **Raspberry Pi Imager**. In the settings ("gear" icon):
 - Set username/password
 - Configure WiFi (or plan to use Ethernet)
 
-Boot the Pi, confirm you can SSH in:
+Boot the Pi, then find its IP address:
 ```bash
-ssh doc@192.168.1.148   # use your Pi's IP
+# From your router's admin page (look for "raspberrypi" in DHCP leases)
+# Or from another machine on the same network:
+ping raspberrypi.local
+
+# Or on the Pi itself (connect a monitor temporarily):
+hostname -I
+```
+
+Confirm SSH works:
+```bash
+ssh <your-pi-user>@<pi-ip>
 ```
 
 ### Step 3 — Run the setup script on the Pi
 
+SSH into the Pi, then:
 ```bash
-# SSH into the Pi, then:
 curl -fsSL https://raw.githubusercontent.com/YOUR_USER/wivi-sentinel/main/setup_pi.sh | bash
 
 # Or with pre-set values (no prompts):
@@ -79,24 +91,36 @@ CSI_SOURCE=esp32 \
 bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/wivi-sentinel/main/setup_pi.sh)
 ```
 
-### Step 4 — Build and deploy the dashboard (on your Mac)
+This clones the repo, installs Python dependencies, and sets up the systemd service.
 
-The Pi has Node v12 which is too old for Vite. Build on your Mac, deploy to Pi:
+### Step 4 — Plug in the ESP32 and start
 
-```bash
-npm install
-npm run build
-rsync -av dist/ doc@192.168.1.148:~/wivi-sentinel/dist/
-```
-
-### Step 5 — Plug in the ESP32 and start
+Move the ESP32 from your Mac to a USB port on the Pi, then:
 
 ```bash
 # On the Pi:
 ~/wivi-sentinel/start.sh
 ```
 
-Open `http://192.168.1.148:5555` in your browser.
+Open `http://<pi-ip>:5555` in your browser.
+
+---
+
+## Deploying Updates
+
+All code updates deploy via git — no file syncing needed.
+
+**On your development machine:**
+```bash
+git add . && git commit -m "your changes" && git push
+```
+
+**On the Pi:**
+```bash
+cd ~/wivi-sentinel && git pull && ./start.sh restart
+```
+
+That's it. `dist/` (the pre-built dashboard) is committed to the repo so the Pi always gets the latest UI on pull.
 
 ---
 
@@ -108,24 +132,24 @@ Open `http://192.168.1.148:5555` in your browser.
 > - Pi IP address
 > - Pi SSH username + password
 > - WiFi SSID + password (for ESP32)
-> - Path to this repository on the Mac/host machine
+> - Path to this repository on the host machine
 
 ---
 
 ### Context you need before starting
 
 ```
-PI_IP=<from user>             # e.g. 192.168.1.148
-PI_USER=<from user>           # e.g. doc
+PI_IP=<from user>             # find with: ping raspberrypi.local or check router DHCP
+PI_USER=<from user>           # the username set in Raspberry Pi Imager
 PI_PASS=<from user>           # for sudo operations
-REPO_DIR=<path on Mac>        # e.g. /Users/fspeiser/Documents/GitHub/wivi-sentinel
+REPO_DIR=<path on host>       # local clone of this repo, e.g. /home/user/wivi-sentinel
 WIFI_SSID=<from user>         # ESP32 must join a 2.4 GHz network
 WIFI_PASSWORD=<from user>
 ```
 
 ---
 
-### Phase 1 — Flash the ESP32 (run on Mac/host)
+### Phase 1 — Flash the ESP32 (run on host machine, not the Pi)
 
 **1.1 Flash firmware**
 ```bash
@@ -136,7 +160,7 @@ Expected: script exits with "Flash complete" or similar success message.
 
 **1.2 Verify ESP32 is streaming CSI**
 ```bash
-# Plug ESP32 into Mac USB first
+# Plug ESP32 into host USB first
 PORT=$(ls /dev/cu.usbserial-* 2>/dev/null | head -1)
 timeout 5 cat "$PORT" 2>/dev/null | grep -c "CSI_DATA" || echo "no CSI data yet"
 ```
@@ -146,7 +170,7 @@ If still zero: run `WIFI_SSID="$WIFI_SSID" WIFI_PASSWORD="$WIFI_PASSWORD" ./setu
 
 ---
 
-### Phase 2 — Pi system setup (run on Mac via SSH)
+### Phase 2 — Pi system setup (run via SSH)
 
 **2.1 Test SSH connectivity**
 ```bash
@@ -186,53 +210,27 @@ Expected: `deps OK`
 
 ---
 
-### Phase 3 — Build and deploy dashboard (run on Mac)
+### Phase 3 — Connect ESP32 and start
 
-**3.1 Build Vite dashboard**
-```bash
-cd "$REPO_DIR"
-npm install --silent
-npm run build
-```
-Expected: `dist/index.html` created (~200 KB JS bundle).
-
-**3.2 Deploy to Pi**
-```bash
-rsync -av --delete \
-  "$REPO_DIR/dist/" \
-  ${PI_USER}@${PI_IP}:~/wivi-sentinel/dist/
-```
-Expected: file list ending with `sent ... bytes`.
-
-**3.3 Verify dashboard file on Pi**
-```bash
-ssh ${PI_USER}@${PI_IP} "ls -lh ~/wivi-sentinel/dist/index.html"
-```
-Expected: file exists, size ~500 bytes.
-
----
-
-### Phase 4 — Connect ESP32 and start
-
-**4.1 Move ESP32 from Mac to Pi USB**
+**3.1 Move ESP32 from host to Pi USB**
 (This is the one physical action — instruct the user if operating remotely)
 
-**4.2 Verify ESP32 appears on Pi**
+**3.2 Verify ESP32 appears on Pi**
 ```bash
 ssh ${PI_USER}@${PI_IP} "ls /dev/ttyUSB*"
 ```
 Expected: `/dev/ttyUSB0`
 If missing: check USB cable (must be data cable), try different USB port.
 
-**4.3 Start all services**
+**3.3 Start all services**
 ```bash
 ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh"
 ```
 `start.sh` auto-detects the systemd unit. If the unit is installed and already active it
 restarts it; otherwise it starts it. Never spawn `python3 server.py` directly on the Pi
-if the systemd unit is installed — `start.sh` or `systemctl` only.
+if the systemd unit is installed — use `start.sh` or `systemctl` only.
 
-**4.4 Verify services are running**
+**3.4 Verify services are running**
 ```bash
 ssh ${PI_USER}@${PI_IP} "wivi-status"
 ```
@@ -240,15 +238,15 @@ Expected: `sentinel: RUNNING`.
 
 ---
 
-### Phase 5 — Smoke test
+### Phase 4 — Smoke test
 
-**5.1 API health check**
+**4.1 API health check**
 ```bash
 curl -sf "http://${PI_IP}:5555/api/status" | python3 -m json.tool
 ```
 Expected: JSON with `"status": "running"` and `"csi_source": "esp32"`.
 
-**5.2 Check for CSI data**
+**4.2 Check for CSI data**
 ```bash
 # Wait 15 seconds, then check profiles
 sleep 15
@@ -260,7 +258,7 @@ If zero after 60s:
 - Check ESP32 is on WiFi: `curl http://${PI_IP}:5555/api/esp32/wifi`
 - Check serial: `ssh ${PI_USER}@${PI_IP} "timeout 3 cat /dev/ttyUSB0 | head -5"`
 
-**5.3 Open dashboard**
+**4.3 Open dashboard**
 ```
 http://${PI_IP}:5555
 ```
@@ -269,14 +267,14 @@ http://${PI_IP}:5555
 
 ### Automated re-deploy (subsequent updates)
 
-When code changes on the Mac, run this to update the Pi and rebuild:
+Push code changes from your development machine, then pull on the Pi:
 
 ```bash
-# From Mac, in repo directory:
-npm run build && \
-rsync -av --exclude node_modules --exclude .git --exclude venv --exclude data \
-  ./ ${PI_USER}@${PI_IP}:~/wivi-sentinel/ && \
-ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh restart"
+# On your development machine:
+git add . && git commit -m "update" && git push
+
+# On the Pi:
+ssh ${PI_USER}@${PI_IP} "cd ~/wivi-sentinel && git pull && ./start.sh restart"
 ```
 
 ---
@@ -383,7 +381,7 @@ cp .env.example .env
 ./start.sh status   # systemctl status wivi-sentinel
 ./start.sh logs     # journalctl -u wivi-sentinel -f
 ./start.sh dev      # Flask API + Vite hot-reload (Mac dev, requires Node >=18)
-./start.sh build    # build dist/ only (Mac)
+./start.sh build    # build dist/ only
 ```
 
 > On the Pi, `auto` mode auto-detects the installed systemd unit and delegates to
@@ -416,9 +414,9 @@ Base URL: `http://<pi-ip>:5555`
 ```
 wivi-sentinel/
 ├── server.py               # Flask API server + detection loop
-├── start.sh                # Unified start script (dev/prod/build)
-├── setup_pi.sh             # Automated Pi deploy + Docker + systemd
-├── setup_esp32.sh          # ESP32 firmware build + flash
+├── start.sh                # Unified start script (dev/prod/systemd)
+├── setup_pi.sh             # Automated Pi deploy + systemd
+├── setup_esp32.sh          # ESP32 firmware build + flash (run on Mac/Linux, not Pi)
 ├── Dockerfile              # Wi-Vi Sentinel container image
 ├── docker-compose.yml      # Docker: sentinel container with ESP32 passthrough
 ├── engine/
@@ -433,14 +431,14 @@ wivi-sentinel/
 │   ├── App.jsx             # Dashboard UI (cards, compact, radar)
 │   ├── main.jsx
 │   └── index.css
-├── dist/                   # Vite build output (gitignored — build on Mac, rsync to Pi)
+├── dist/                   # Pre-built dashboard (committed — no build step needed on Pi)
 ├── index.legacy.html       # CDN Babel fallback (no build required)
 ├── vite.config.js
 ├── package.json
 ├── requirements.txt        # Python deps
 ├── .env.example            # Config template (copy to .env)
 └── data/
-    └── profiles.json       # Biometric profiles (gitignored)
+    └── profiles.json       # Biometric profiles (gitignored — each install tracks its own)
 ```
 
 ---
@@ -494,14 +492,6 @@ sudo journalctl -u wivi-sentinel -n 50
 ```bash
 sudo usermod -aG dialout $USER
 # Log out and back in, then retry
-```
-
-### Docker permission denied
-
-```bash
-sudo usermod -aG docker $USER
-# Log out and back in, then retry
-newgrp docker   # or: sg docker -c "wivi-start"
 ```
 
 ### Build error: esp_csi_gain_ctrl missing version
