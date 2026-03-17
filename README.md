@@ -1,9 +1,7 @@
 # Wi-Vi Sentinel
 
-WiFi CSI biometric detection, classification, and tracking system.
-Passive through-wall sensing using an ESP32 + Raspberry Pi 4.
-
-## How It Works
+WiFi CSI biometric detection, classification, and tracking.
+Passive through-wall sensing using an ESP32 + Raspberry Pi 4 + optional RuView pose estimation.
 
 ```
                          WiFi signals (2.4 GHz)
@@ -12,328 +10,372 @@ Passive through-wall sensing using an ESP32 + Raspberry Pi 4.
        │                            (bodies disturb signal)
        │                                      │
        │         [ESP32-DevKitC-32E] ◄─ ─ ─ ─ ┘
-       │              │  Captures CSI (Channel State Information)
-       │              │  from every WiFi packet on the network
-       │              │
-       │              │ USB serial @ 921600 baud
+       │              │  Captures CSI from every WiFi packet
+       │              │  USB serial @ 921600 baud
        │              │
   [Raspberry Pi 4] ◄──┘
        │  server.py — signal processing, classification
        │  Species / sex / direction / device correlation
+       │  Optional: RuView (Docker) — 17-keypoint pose estimation
        │
-       └──► http://<pi-ip>:5555
-             Wi-Vi Sentinel Dashboard
+       └──► http://<pi-ip>:5555  (dashboard + API)
+            http://<pi-ip>:3100  (RuView Observatory)
 ```
-
-The ESP32 connects to your 2.4 GHz WiFi network and extracts CSI
-(Channel State Information) from every packet. CSI captures how radio
-signals are distorted by nearby bodies — breathing modulates the signal
-at ~0.2 Hz, heartbeats at ~1 Hz, and walking creates distinctive gait
-patterns.
-
-The Pi reads CSI frames over USB serial, classifies detected biometric
-signatures (species, sex, direction of movement), and serves a real-time
-dashboard.
 
 ---
 
 ## Hardware Required
 
-- **ESP32-DevKitC-32E** — CSI capture device (~$10)
-- **Raspberry Pi 4 Model B** (any RAM variant) — runs the server
-- **USB-A to Micro-USB data cable** — connects ESP32 to Pi (must be a data cable, not charge-only)
-- **Micro SD card** (16 GB+) for the Pi
-- **USB-C power supply** for the Pi
-- **Ethernet cable** (recommended) — for reliable Pi network connectivity
-- **Your existing router** — must broadcast on **2.4 GHz** (ESP32 is 2.4 GHz only)
+| Item | Notes |
+|---|---|
+| **ESP32-DevKitC-32E** | CSI capture (~$10). Must be the 32E variant — S3/C6 don't work with this firmware |
+| **Raspberry Pi 4 Model B** | Any RAM size. Runs server, Docker, RuView |
+| **USB-A to Micro-USB cable** | Data cable (not charge-only) — connects ESP32 to Pi |
+| **Micro SD card** (16 GB+) | For Pi OS |
+| **USB-C power supply** | For Pi (≥3A recommended) |
+| **Ethernet cable** | Strongly recommended — Pi WiFi is free but router DHCP can be unreliable |
 
-> **Note:** The Pi's WiFi is free since the ESP32 handles CSI capture over USB.
-> However, some routers (e.g. Spectrum) may not issue DHCP leases over WiFi
-> reliably. If the Pi can't get a WiFi IP, use **Ethernet** for connectivity.
-> An Ethernet cable is recommended for the most reliable setup.
+> The Pi's WiFi card is unused — the ESP32 handles CSI capture. Connect the Pi via Ethernet for a stable server connection.
 
 ---
 
 ## Quick Start
 
-### 1. Flash the ESP32
-
-On your Mac or Linux machine (not the Pi):
+### Step 1 — Flash the ESP32 (on your Mac or Linux machine, not the Pi)
 
 ```bash
 chmod +x setup_esp32.sh
+
+# With prompts:
 ./setup_esp32.sh
-```
 
-This script automates the full ESP32 setup:
-- Installs ESP-IDF (Espressif IoT Development Framework)
-- Clones the esp-csi repository
-- Prompts for your 2.4 GHz WiFi credentials
-- Builds and flashes the `csi_recv_router` firmware
-
-You can also set environment variables to skip the prompts:
-
-```bash
+# Or fully automated:
 WIFI_SSID="YourNetwork" WIFI_PASSWORD="YourPassword" ./setup_esp32.sh
 ```
 
-See [ESP32 Setup Details](#esp32-setup-details) for manual steps and troubleshooting.
+Installs ESP-IDF, builds and flashes the `csi_recv_router` firmware.
+See [ESP32 Details](#esp32-setup-details) for manual steps.
 
-### 2. Set up the Raspberry Pi
+### Step 2 — Flash Raspberry Pi OS
 
-Flash **Raspberry Pi OS Lite** with Raspberry Pi Imager. In settings:
+Use **Raspberry Pi Imager**. In the settings ("gear" icon):
 - Enable SSH
+- Set hostname (e.g. `raspberrypi`)
 - Set username/password
-- Configure WiFi
+- Configure WiFi (or plan to use Ethernet)
 
-Boot the Pi, SSH in, and install dependencies:
-
+Boot the Pi, confirm you can SSH in:
 ```bash
-ssh pi@raspberrypi.local
-sudo apt update && sudo apt install python3 python3-pip python3-venv
+ssh doc@192.168.1.148   # use your Pi's IP
 ```
 
-### 3. Deploy Wi-Vi Sentinel to the Pi
-
-Clone the repo on the Pi (or copy from your Mac):
+### Step 3 — Run the setup script on the Pi
 
 ```bash
-# Option A: clone directly on the Pi
-ssh pi@raspberrypi.local
-git clone https://github.com/YOUR_USER/wivi-sentinel.git ~/wivi-sentinel
+# SSH into the Pi, then:
+curl -fsSL https://raw.githubusercontent.com/YOUR_USER/wivi-sentinel/main/setup_pi.sh | bash
 
-# Option B: copy from your Mac
-scp -r . pi@raspberrypi.local:~/wivi-sentinel/
+# Or with pre-set values (no prompts):
+WIVI_REPO="https://github.com/YOUR_USER/wivi-sentinel.git" \
+CSI_SOURCE=esp32 \
+bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/wivi-sentinel/main/setup_pi.sh)
 ```
 
-On the Pi, install Python dependencies:
+### Step 4 — Build and deploy the dashboard (on your Mac)
+
+The Pi has Node v12 which is too old for Vite. Build on your Mac, deploy to Pi:
 
 ```bash
+npm install
+npm run build
+rsync -av dist/ doc@192.168.1.148:~/wivi-sentinel/dist/
+```
+
+### Step 5 — Plug in the ESP32 and start
+
+```bash
+# On the Pi:
+wivi-start
+```
+
+Open `http://192.168.1.148:5555` in your browser.
+
+---
+
+## 🤖 AI Agent Setup Guide
+
+> **For Claude, Codex, Cursor, and other AI coding assistants.**
+> This section is written as executable instructions. Follow each block in sequence.
+> Verify each step before proceeding. Zero human interaction required after you have:
+> - Pi IP address
+> - Pi SSH username + password
+> - WiFi SSID + password (for ESP32)
+> - Path to this repository on the Mac/host machine
+
+---
+
+### Context you need before starting
+
+```
+PI_IP=<from user>             # e.g. 192.168.1.148
+PI_USER=<from user>           # e.g. doc
+PI_PASS=<from user>           # for sudo operations
+REPO_DIR=<path on Mac>        # e.g. /Users/fspeiser/Documents/GitHub/wivi-sentinel
+WIFI_SSID=<from user>         # ESP32 must join a 2.4 GHz network
+WIFI_PASSWORD=<from user>
+```
+
+---
+
+### Phase 1 — Flash the ESP32 (run on Mac/host)
+
+**1.1 Flash firmware**
+```bash
+cd "$REPO_DIR"
+WIFI_SSID="$WIFI_SSID" WIFI_PASSWORD="$WIFI_PASSWORD" ./setup_esp32.sh
+```
+Expected: script exits with "Flash complete" or similar success message.
+
+**1.2 Verify ESP32 is streaming CSI**
+```bash
+# Plug ESP32 into Mac USB first
+PORT=$(ls /dev/cu.usbserial-* 2>/dev/null | head -1)
+timeout 5 cat "$PORT" 2>/dev/null | grep -c "CSI_DATA" || echo "no CSI data yet"
+```
+Expected: one or more `CSI_DATA` lines within 5 seconds.
+If zero: press the EN/RST button on the ESP32, wait 5s, retry.
+If still zero: run `WIFI_SSID="$WIFI_SSID" WIFI_PASSWORD="$WIFI_PASSWORD" ./setup_esp32.sh` again.
+
+---
+
+### Phase 2 — Pi system setup (run on Mac via SSH)
+
+**2.1 Test SSH connectivity**
+```bash
+ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+    ${PI_USER}@${PI_IP} "echo OK"
+```
+Expected output: `OK`
+If fails: verify Pi is on network, check IP, ensure SSH is enabled in Imager settings.
+
+**2.2 Upload setup script**
+```bash
+scp "$REPO_DIR/setup_pi.sh" ${PI_USER}@${PI_IP}:~/setup_pi.sh
+```
+
+**2.3 Run setup on Pi (fully automated)**
+```bash
+ssh ${PI_USER}@${PI_IP} "
+  export WIVI_REPO='https://github.com/YOUR_USER/wivi-sentinel.git'
+  export WIVI_DIR='\$HOME/wivi-sentinel'
+  export WIVI_USER='${PI_USER}'
+  export CSI_SOURCE=esp32
+  export ESP32_SERIAL_PORT=/dev/ttyUSB0
+  export ESP32_BAUD_RATE=921600
+  export FLASK_PORT=5555
+  export RUVIEW_PORT=3100
+  export RUVIEW_ENABLED=true
+  bash ~/setup_pi.sh
+"
+```
+Expected: script completes with summary banner showing dashboard URL.
+Duration: 3–8 minutes (Docker install + pip install).
+
+**2.4 Verify Python environment**
+```bash
+ssh ${PI_USER}@${PI_IP} \
+  "~/wivi-sentinel/venv/bin/python3 -c 'import flask, numpy, scipy, serial; print(\"deps OK\")'"
+```
+Expected: `deps OK`
+
+**2.5 Verify Docker**
+```bash
+ssh ${PI_USER}@${PI_IP} "docker --version && docker ps"
+```
+Expected: Docker version line + running containers list (may include `wivi-ruview`).
+
+---
+
+### Phase 3 — Build and deploy dashboard (run on Mac)
+
+**3.1 Build Vite dashboard**
+```bash
+cd "$REPO_DIR"
+npm install --silent
+npm run build
+```
+Expected: `dist/index.html` created (~200 KB JS bundle).
+
+**3.2 Deploy to Pi**
+```bash
+rsync -av --delete \
+  "$REPO_DIR/dist/" \
+  ${PI_USER}@${PI_IP}:~/wivi-sentinel/dist/
+```
+Expected: file list ending with `sent ... bytes`.
+
+**3.3 Verify dashboard file on Pi**
+```bash
+ssh ${PI_USER}@${PI_IP} "ls -lh ~/wivi-sentinel/dist/index.html"
+```
+Expected: file exists, size ~500 bytes.
+
+---
+
+### Phase 4 — Connect ESP32 and start
+
+**4.1 Move ESP32 from Mac to Pi USB**
+(This is the one physical action — instruct the user if operating remotely)
+
+**4.2 Verify ESP32 appears on Pi**
+```bash
+ssh ${PI_USER}@${PI_IP} "ls /dev/ttyUSB*"
+```
+Expected: `/dev/ttyUSB0`
+If missing: check USB cable (must be data cable), try different USB port.
+
+**4.3 Start all services**
+```bash
+ssh ${PI_USER}@${PI_IP} "wivi-start"
+```
+Or via systemd:
+```bash
+ssh ${PI_USER}@${PI_IP} "sudo systemctl start wivi-ruview wivi-sentinel"
+```
+
+**4.4 Verify services are running**
+```bash
+ssh ${PI_USER}@${PI_IP} "wivi-status"
+```
+Expected: both `sentinel: RUNNING` and `ruview: RUNNING`.
+
+---
+
+### Phase 5 — Smoke test
+
+**5.1 API health check**
+```bash
+curl -sf "http://${PI_IP}:5555/api/status" | python3 -m json.tool
+```
+Expected: JSON with `"status": "running"` and `"csi_source": "esp32"`.
+
+**5.2 Check for CSI data**
+```bash
+# Wait 15 seconds, then check profiles
+sleep 15
+curl -sf "http://${PI_IP}:5555/api/profiles" | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{len(d['profiles'])} profiles detected\")"
+```
+Expected: `1 profiles detected` or more within 30 seconds.
+If zero after 60s:
+- Check ESP32 is on WiFi: `curl http://${PI_IP}:5555/api/esp32/wifi`
+- Check serial: `ssh ${PI_USER}@${PI_IP} "timeout 3 cat /dev/ttyUSB0 | head -5"`
+
+**5.3 RuView health check**
+```bash
+curl -sf "http://${PI_IP}:3100/health" || echo "RuView not yet ready (may still be starting)"
+```
+
+**5.4 Open dashboard**
+```
+http://${PI_IP}:5555
+```
+
+---
+
+### Automated re-deploy (subsequent updates)
+
+When code changes on the Mac, run this to update the Pi and rebuild:
+
+```bash
+# From Mac, in repo directory:
+npm run build && \
+rsync -av --exclude node_modules --exclude .git --exclude venv --exclude data \
+  ./ ${PI_USER}@${PI_IP}:~/wivi-sentinel/ && \
+ssh ${PI_USER}@${PI_IP} "sudo systemctl restart wivi-sentinel"
+```
+
+---
+
+### Rollback
+
+```bash
+# Stop everything
+ssh ${PI_USER}@${PI_IP} "wivi-stop"
+
+# Clear profiles
+ssh ${PI_USER}@${PI_IP} "echo '{}' > ~/wivi-sentinel/data/profiles.json"
+
+# Restart
+ssh ${PI_USER}@${PI_IP} "wivi-start"
+```
+
+---
+
+## Docker Mode (alternative to systemd)
+
+Run the full stack in Docker Compose (ESP32 USB passthrough required):
+
+```bash
+# On the Pi:
 cd ~/wivi-sentinel
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+
+# Build the sentinel image
+docker build -t wivi-sentinel .
+
+# Start both services
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
 ```
 
-Build and deploy the dashboard (on your Mac, since the Pi may not have Node):
+The `docker-compose.yml` passes `/dev/ttyUSB0` into the sentinel container and connects it to the RuView container over the internal Docker network.
 
-```bash
-npm install && npm run build
-scp -r dist pi@raspberrypi.local:~/wivi-sentinel/
-```
-
-> **Note:** `dist/` is gitignored, so after `git pull` on the Pi you'll need to
-> re-scp the `dist/` folder or build it locally with `npm run build`.
-
-### 4. Connect the ESP32
-
-1. Unplug the ESP32 from your Mac
-2. Plug it into the Pi's USB port
-3. Verify the serial device appears:
-
-```bash
-ls /dev/ttyUSB*   # should show /dev/ttyUSB0
-```
-
-### 5. Configure and run
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Set:
-```dotenv
-CSI_SOURCE=esp32
-ESP32_SERIAL_PORT=/dev/ttyUSB0
-ESP32_BAUD_RATE=921600
-```
-
-Start the server:
-```bash
-python3 server.py
-```
-
-Open `http://<pi-ip>:5555` in your browser.
-
----
-
-## Host Machine Setup (Mac / Linux)
-
-You can also run `server.py` on your Mac/Linux machine instead of the Pi
-(useful for development or when the ESP32 is plugged directly into your machine).
-
-### Prerequisites
-
-**macOS**
-
-```bash
-brew install python node
-```
-
-**Linux (Debian / Ubuntu)**
-
-```bash
-sudo apt update
-sudo apt install python3 python3-pip python3-venv nodejs npm
-
-# mDNS device scanning requires avahi-daemon:
-sudo apt install avahi-daemon
-sudo systemctl enable --now avahi-daemon
-```
-
-> **Probe request sniffing on Linux** — `scapy` needs raw socket access. Either run `server.py` with `sudo`, or grant the capability without root:
-> ```bash
-> sudo setcap cap_net_raw+ep $(which python3)
-> ```
-> mDNS scanning works without elevated privileges.
-
----
-
-### Python backend
-
-```bash
-pip3 install -r requirements.txt
-# or inside a virtualenv:
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Dashboard (two options)
-
-**Option A — no build step (CDN Babel, works immediately):**
-
-```bash
-python3 server.py
-# Mac:   open http://localhost:5555
-# Linux: xdg-open http://localhost:5555
-```
-
-**Option B — Vite build (faster, production-ready):**
-
-```bash
-npm install
-npm run build          # outputs to dist/
-python3 server.py      # automatically serves dist/ when present
-```
-
-**Option B dev mode (hot reload):**
-
-```bash
-npm install
-python3 server.py &    # Flask API on :5555
-npm run dev            # Vite dev server on :3000, proxies /api to Flask
-```
-
-### Simulated mode (no hardware required)
-
-```bash
-python3 server.py
-```
-
-Generates 5 synthetic entities (3 humans, 1 dog, 1 cat) with realistic biometrics.
+> **Note:** If you added your user to the `docker` group during setup, log out and back in before running Docker commands directly. Or prefix with `sudo`.
 
 ---
 
 ## ESP32 Setup Details
 
-### What the setup script does
+### What `setup_esp32.sh` does
 
-`setup_esp32.sh` performs these steps:
+1. Installs ESP-IDF (Espressif IoT Development Framework)
+2. Clones `esp-csi` repository (Espressif's CSI tools)
+3. Patches `app_main.c` with custom WiFi/NVS/UART command handler
+4. Writes WiFi credentials to `sdkconfig.defaults`
+5. Handles ESP-IDF version compatibility (copies prebuilt libraries)
+6. Builds and flashes `csi_recv_router` firmware
 
-1. **Installs ESP-IDF** — Espressif's IoT Development Framework (release/v5.4)
-2. **Clones esp-csi** — Espressif's CSI tools and examples
-3. **Configures firmware** — writes WiFi credentials and CSI settings to `sdkconfig.defaults.user`
-4. **Handles version compatibility** — copies prebuilt libraries for newer ESP-IDF versions
-5. **Builds and flashes** — compiles `csi_recv_router` firmware and flashes it to the ESP32
+### Changing WiFi credentials after flashing
 
-### Manual ESP32 setup
+From the dashboard: open any profile card → click "ESP32 WIFI" in the sidebar → enter new SSID + password → SET WIFI.
+The ESP32 saves credentials to NVS (non-volatile storage) and reboots.
 
-If you prefer to set up manually or the script doesn't work:
-
+Via API:
 ```bash
-# 1. Install ESP-IDF
-mkdir -p ~/esp
-git clone --recursive --branch release/v5.4 \
-    https://github.com/espressif/esp-idf.git ~/esp/esp-idf
-cd ~/esp/esp-idf && ./install.sh esp32
-source ~/esp/esp-idf/export.sh
-
-# 2. Clone esp-csi
-git clone https://github.com/espressif/esp-csi.git ~/esp/esp-csi
-
-# 3. Build and flash
-cd ~/esp/esp-csi/examples/get-started/csi_recv_router
-idf.py set-target esp32
-idf.py menuconfig   # Set WiFi SSID/password under "Example Configuration"
-idf.py build
-idf.py flash -p /dev/cu.usbserial-110   # your port may differ
+curl -X POST http://<pi-ip>:5555/api/esp32/wifi \
+  -H "Content-Type: application/json" \
+  -d '{"ssid": "NewNetwork", "password": "NewPassword"}'
 ```
 
 ### Verifying CSI output
 
 ```bash
 source ~/esp/esp-idf/export.sh
-cd ~/esp/esp-csi/examples/get-started/csi_recv_router
-idf.py monitor -p /dev/cu.usbserial-110
-```
-
-You should see WiFi connection logs followed by `CSI_DATA` lines. Press the
-**EN/RST** button on the ESP32 if no output appears. Quit with `Ctrl+]`.
-
-### Generating WiFi traffic
-
-The ESP32 captures CSI from WiFi packets on the network. More traffic means
-more CSI frames. To generate traffic, ping the router from the Pi:
-
-```bash
-ping 192.168.1.1
+idf.py monitor -p /dev/cu.usbserial-*
+# Should show CSI_DATA lines after WiFi connects
+# Press Ctrl+] to quit
 ```
 
 ---
 
-## Nexmon CSI (Legacy)
+## Configuration Reference
 
-The original architecture used the Pi 4's onboard BCM43455c0 WiFi chip with
-Nexmon CSI firmware in monitor mode. This required Ethernet for connectivity
-(since WiFi was in monitor mode) and a specific Nexmon firmware patch.
-
-If you prefer the Nexmon approach, see `setup_pi.sh` and set `CSI_SOURCE=nexmon`
-in your `.env`. Note that Nexmon firmware compatibility varies by kernel version
-and may require troubleshooting.
-
----
-
-## Device Name Correlation
-
-The system passively discovers nearby device names (phones, laptops) via:
-- **mDNS/Bonjour** — picks up hostnames like "Knibb High Football Rules.local"
-- **WiFi probe requests** — captured on the monitor interface (set `PROBE_IFACE=mon0`)
-
-As subjects are detected, the system builds a co-presence matrix between
-CSI profiles and nearby devices. To associate a profile with a device:
-
-1. Open a profile card in the dashboard
-2. Under **DEVICE LINK**, click **TAG** next to a device name
-3. The system watches co-presence confidence. Once it exceeds 82% across
-   at least 10 observations, it auto-confirms the association and tags the profile.
-
-Or via the API directly:
-
-```bash
-curl -X POST http://localhost:5555/api/devices/suggest \
-  -H "Content-Type: application/json" \
-  -d '{"profile_id": "abc123def456", "device_name": "Knibb High Football Rules"}'
-```
-
-Set `PROBE_IFACE=mon0` (or `wlan0`) on the Pi to enable probe request capture.
-mDNS scanning runs automatically when `zeroconf` is installed.
-
----
-
-## Configuration (.env)
-
-All ports and runtime options are configured via a `.env` file in the project root.
-Copy the committed example and edit as needed:
+Copy `.env.example` to `.env` and edit:
 
 ```bash
 cp .env.example .env
@@ -341,28 +383,47 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |---|---|---|
-| `FLASK_PORT` | `5555` | Port the Flask API server listens on |
-| `VITE_PORT` | `3000` | Port the Vite dev server listens on |
+| `FLASK_PORT` | `5555` | Flask API + dashboard port |
+| `VITE_PORT` | `3000` | Vite dev server port (dev mode only) |
 | `CSI_SOURCE` | `simulated` | `simulated`, `esp32`, or `nexmon` |
-| `ESP32_SERIAL_PORT` | `/dev/ttyUSB0` | Serial port for ESP32 USB connection |
-| `ESP32_BAUD_RATE` | `921600` | Baud rate (must match firmware config) |
-| `CSI_UDP_PORT` | `5500` | UDP port for Nexmon CSI frames (legacy) |
-| `PROBE_IFACE` | _(none)_ | Monitor interface for probe sniffing (e.g. `mon0`) |
+| `ESP32_SERIAL_PORT` | `/dev/ttyUSB0` | ESP32 USB serial device |
+| `ESP32_BAUD_RATE` | `921600` | Must match firmware config |
+| `PROBE_IFACE` | _(none)_ | Monitor interface for probe sniffing (`mon0`) |
+| `RUVIEW_PORT` | `3100` | Host port for RuView Docker container |
+| `RUVIEW_URL` | `http://localhost:3100` | URL Flask proxies RuView requests to |
+| `RUVIEW_ENABLED` | `true` | Set `false` to skip Docker/RuView entirely |
+| `RUVIEW_CSI_SOURCE` | `simulated` | RuView's own CSI source (usually `simulated`) |
 
-`.env` is gitignored. `.env.example` is committed as a reference template.
+### `start.sh` modes
 
-### PROBE_IFACE examples
-
-```dotenv
-# Disabled — mDNS still runs, probe sniffing off (default)
-PROBE_IFACE=
-
-# Nexmon monitor interface created by setup_pi.sh (legacy setup)
-PROBE_IFACE=mon0
-
-# Some setups name it differently — check with: iw dev
-PROBE_IFACE=wlan0mon
+```bash
+./start.sh          # auto: prod if Node <18, dev if Node >=18
+./start.sh prod     # Flask serves pre-built dist/ (Pi)
+./start.sh dev      # Flask API + Vite hot-reload (Mac dev)
+./start.sh build    # build dist/ only (Mac)
 ```
+
+---
+
+## API Reference
+
+Base URL: `http://<pi-ip>:5555`
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/status` | System status, active signals, config |
+| GET | `/api/profiles` | All biometric profiles (coalesced) |
+| POST | `/api/profiles/tag` | `{profile_id, nickname}` — tag a profile |
+| DELETE | `/api/profiles/:id` | Scrub profile (wipes signature data) |
+| GET | `/api/detections` | Current detections + recent history |
+| GET | `/api/devices` | Visible nearby devices + correlation scores |
+| POST | `/api/devices/suggest` | `{profile_id, device_name}` — suggest association |
+| POST | `/api/esp32/wifi` | `{ssid, password}` — update ESP32 WiFi (reboots) |
+| GET | `/api/esp32/wifi` | Current ESP32 WiFi connection status |
+| GET | `/api/ruview/status` | RuView reachability check |
+| GET | `/api/ruview/pose` | Proxied: RuView 17-keypoint pose |
+| GET | `/api/ruview/vitals` | Proxied: RuView breathing + heart rate |
+| GET | `/api/stream` | Server-sent events (real-time detection stream) |
 
 ---
 
@@ -371,28 +432,29 @@ PROBE_IFACE=wlan0mon
 ```
 wivi-sentinel/
 ├── server.py               # Flask API server + detection loop
+├── start.sh                # Unified start script (dev/prod/build)
+├── setup_pi.sh             # Automated Pi deploy + Docker + systemd
+├── setup_esp32.sh          # ESP32 firmware build + flash
+├── Dockerfile              # Wi-Vi Sentinel container image
+├── docker-compose.yml      # Full stack: sentinel + ruview
 ├── engine/
-│   ├── __init__.py
-│   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore
-│   ├── csi_collector.py    # CSI frame collection utilities
-│   ├── esp32_source.py     # ESP32 CSI source (USB serial)
+│   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore, coalescing
+│   ├── esp32_source.py     # ESP32 CSI source (USB serial + WiFi config commands)
 │   ├── nexmon_source.py    # Nexmon CSI source (UDP, legacy)
-│   └── device_scanner.py   # mDNS + probe request device discovery
-├── nexmon_source.py        # Nexmon source (root-level, legacy)
-├── csi_extractor.py        # Pi-side CSI capture for Nexmon (legacy)
-├── setup_esp32.sh          # ESP32 firmware setup script
-├── setup_pi.sh             # Pi setup script (Nexmon, legacy)
+│   ├── device_scanner.py   # mDNS + probe request device discovery
+│   └── csi_collector.py    # CSI frame collection utilities
+├── firmware/
+│   └── csi_recv_router/    # Patched ESP32 firmware (NVS WiFi + UART commands)
 ├── src/                    # Vite/React dashboard source
+│   ├── App.jsx             # Dashboard UI (cards, compact, radar, RuView modal)
 │   ├── main.jsx
-│   ├── App.jsx             # Dashboard UI (cards, compact view, radar)
 │   └── index.css
-├── dist/                   # Vite build output (gitignored, scp to Pi)
-├── index.html              # Vite entry point
+├── dist/                   # Vite build output (gitignored — build on Mac, rsync to Pi)
 ├── index.legacy.html       # CDN Babel fallback (no build required)
 ├── vite.config.js
 ├── package.json
-├── requirements.txt        # Python deps (flask, numpy, scipy, pyserial, etc.)
-├── .env.example            # Reference config (copy to .env locally)
+├── requirements.txt        # Python deps
+├── .env.example            # Config template (copy to .env)
 └── data/
     └── profiles.json       # Biometric profiles (gitignored)
 ```
@@ -401,65 +463,91 @@ wivi-sentinel/
 
 ## Troubleshooting
 
-### ESP32
+### ESP32 not sending CSI
 
-**No serial device found**
 ```bash
-ls /dev/ttyUSB*          # Linux / Pi
+# Check serial device exists
+ls /dev/ttyUSB*          # Pi / Linux
 ls /dev/cu.usbserial-*   # macOS
+
+# Check ESP32 is on WiFi
+curl http://<pi-ip>:5555/api/esp32/wifi
+
+# Watch raw serial output
+cat /dev/ttyUSB0 | head -20
+# Should see CSI_DATA lines. If blank: press EN/RST button on ESP32.
+
+# Generate WiFi traffic to trigger more CSI frames
+ping <router-ip>
 ```
-If nothing appears, try a different USB cable (some are charge-only) or port.
 
-**ESP32 not sending CSI_DATA**
-- Verify the ESP32 is connected to your WiFi: look for `sta ip:` in the boot log
-- Make sure your router broadcasts on **2.4 GHz** (ESP32 cannot connect to 5 GHz)
-- Press the **EN/RST** button on the ESP32 to reboot it
-- Generate WiFi traffic: `ping <router-ip>` from any device on the network
+Common causes: charge-only USB cable, 5 GHz-only SSID, wrong baud rate, wrong serial port.
 
-**Garbage characters in serial monitor**
-- Baud rate mismatch. The firmware is configured for 921600 baud. Use:
-  ```bash
-  idf.py monitor -p /dev/cu.usbserial-110
-  ```
-  (reads baud rate from sdkconfig automatically)
+### No profiles appearing
 
-**Build error: esp_csi_gain_ctrl missing version**
+```bash
+# Check detection loop is running
+curl http://<pi-ip>:5555/api/status
+
+# Check signal quality — look for non-zero variance in server logs
+sudo journalctl -u wivi-sentinel -f
+# Should see [DBG] var=... lines every ~1 second
+
+# Low signal: move closer, reduce obstructions, generate WiFi traffic
+ping <router-ip>
+```
+
+### RuView not reachable
+
+```bash
+# Check container status
+docker ps | grep ruview
+docker logs wivi-ruview
+
+# Restart container
+docker restart wivi-ruview
+
+# Check port is exposed
+curl http://localhost:3100/health
+```
+
+### Dashboard shows "OFFLINE"
+
+Flask is not running or unreachable. Check:
+```bash
+sudo systemctl status wivi-sentinel
+sudo journalctl -u wivi-sentinel -n 50
+```
+
+### Permission denied on /dev/ttyUSB0
+
+```bash
+sudo usermod -aG dialout $USER
+# Log out and back in, then retry
+```
+
+### Docker permission denied
+
+```bash
+sudo usermod -aG docker $USER
+# Log out and back in, then retry
+newgrp docker   # or: sg docker -c "wivi-start"
+```
+
+### Build error: esp_csi_gain_ctrl missing version
+
 ```
 No rule to make target .../6.1/esp32/libesp_csi_gain_ctrl.a
 ```
-The prebuilt library doesn't have your ESP-IDF version yet. Copy the closest:
 ```bash
 cd managed_components/espressif__esp_csi_gain_ctrl
 cp -r 6.0 6.1   # adjust versions as needed
 ```
 
-**`invalid header: 0xffffffff` in boot log**
-- The ESP32 flash is empty or corrupted. Reflash:
-  ```bash
-  idf.py flash -p /dev/cu.usbserial-110
-  ```
+---
 
-### Nexmon (legacy)
+## Nexmon Legacy
 
-**Pi not sending data**
-```bash
-sudo journalctl -u wivi-csi -n 50
-iw dev wlan0 info   # should show "type monitor"
-```
+The original architecture used the Pi 4's onboard BCM43455c0 WiFi chip with Nexmon CSI firmware in monitor mode. This is superseded by the ESP32 approach and is only relevant if you have specific hardware constraints.
 
-**Mac not receiving**
-```bash
-lsof -i :5500                          # check port is free
-sudo tcpdump -i en0 udp port 5500 -c 5 # verify packets arriving
-```
-
-**Wrong channel / no CSI**
-```bash
-sudo iw dev wlan0 scan | grep -E "freq|signal"
-```
-
-**Firmware replaced after kernel update**
-```bash
-cd /opt/nexmon_csi/patches/bcm43455c0/7_45_189/nexmon_csi/
-make install
-```
+Set `CSI_SOURCE=nexmon` in `.env` and refer to the Nexmon documentation if needed. The `csi_extractor.py` and legacy `setup_pi.sh` Nexmon sections apply to that path.

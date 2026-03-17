@@ -1,359 +1,433 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# Wi-Vi Sentinel — Raspberry Pi 4 Model B Nexmon CSI Setup
+# Wi-Vi Sentinel — Raspberry Pi Full Setup Script
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Run this on a fresh Raspberry Pi OS (32-bit recommended for Nexmon compat).
-# This script:
-#   1. Installs build dependencies
-#   2. Clones and builds Nexmon + CSI extractor
-#   3. Patches the BCM43455c0 firmware for CSI extraction
-#   4. Installs the CSI extractor daemon
-#   5. Configures monitor mode on wlan0
-#   6. Sets up the UDP forwarder service
+# Installs and configures everything needed to run Wi-Vi Sentinel on a
+# Raspberry Pi 4 with an ESP32 CSI sensor over USB.
 #
-# Usage:
-#   chmod +x setup_pi.sh
-#   sudo ./setup_pi.sh
+# Fully non-interactive when environment variables are pre-set.
+# Prompts for any required value not already in the environment.
 #
-# IMPORTANT: This must run on a Raspberry Pi 4 Model B with Raspberry Pi OS.
-#            32-bit Bullseye or Bookworm recommended. 64-bit may require
-#            additional patches.
+# USAGE (human):
+#   curl -fsSL https://raw.githubusercontent.com/YOUR_USER/wivi-sentinel/main/setup_pi.sh | bash
+#   # or clone first, then:
+#   chmod +x setup_pi.sh && ./setup_pi.sh
+#
+# USAGE (pre-configured / AI agents):
+#   export WIVI_REPO="https://github.com/YOUR_USER/wivi-sentinel.git"
+#   export WIVI_DIR="$HOME/wivi-sentinel"
+#   export WIVI_USER="$USER"
+#   export FLASK_PORT=5555
+#   export RUVIEW_PORT=3100
+#   export CSI_SOURCE=esp32
+#   export ESP32_SERIAL_PORT=/dev/ttyUSB0
+#   export ESP32_BAUD_RATE=921600
+#   export RUVIEW_ENABLED=true
+#   ./setup_pi.sh
+#
+# Optional env vars (skip prompts entirely):
+#   WIFI_SSID         — used to update ESP32 WiFi via API after startup
+#   WIFI_PASSWORD     — (same)
+#   RUVIEW_ENABLED    — set false to skip Docker / RuView install
+#   SKIP_DOCKER       — set true to skip Docker install
+#   SKIP_SYSTEMD      — set true to skip systemd service creation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-set -e
+set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# ── Colours ──────────────────────────────────────────────────────────────────
 
-log() { echo -e "${GREEN}[SENTINEL]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-# ─── Preflight checks ────────────────────────────────────────────────────────
+log()  { echo -e "${GREEN}[SENTINEL]${NC} $*"; }
+info() { echo -e "${CYAN}[INFO]${NC}     $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}     $*"; }
+err()  { echo -e "${RED}[ERROR]${NC}    $*"; exit 1; }
+step() { echo -e "\n${BOLD}${CYAN}━━ $* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 
-if [ "$EUID" -ne 0 ]; then
-    err "Must run as root: sudo ./setup_pi.sh"
+# ── Defaults ─────────────────────────────────────────────────────────────────
+
+WIVI_REPO="${WIVI_REPO:-https://github.com/YOUR_USER/wivi-sentinel.git}"
+WIVI_DIR="${WIVI_DIR:-$HOME/wivi-sentinel}"
+WIVI_USER="${WIVI_USER:-$USER}"
+FLASK_PORT="${FLASK_PORT:-5555}"
+VITE_PORT="${VITE_PORT:-3000}"
+RUVIEW_PORT="${RUVIEW_PORT:-3100}"
+CSI_SOURCE="${CSI_SOURCE:-esp32}"
+ESP32_SERIAL_PORT="${ESP32_SERIAL_PORT:-/dev/ttyUSB0}"
+ESP32_BAUD_RATE="${ESP32_BAUD_RATE:-921600}"
+RUVIEW_ENABLED="${RUVIEW_ENABLED:-true}"
+SKIP_DOCKER="${SKIP_DOCKER:-false}"
+SKIP_SYSTEMD="${SKIP_SYSTEMD:-false}"
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+
+step "Preflight checks"
+
+# Detect architecture
+ARCH=$(uname -m)
+info "Architecture: $ARCH"
+info "OS: $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || uname -s)"
+
+# Warn if not running on Pi (non-fatal)
+if ! grep -qiE "raspberry|BCM" /proc/cpuinfo 2>/dev/null; then
+    warn "This doesn't look like a Raspberry Pi — continuing anyway"
 fi
 
-# Verify we're on a Pi 4
-if ! grep -q "BCM2711" /proc/cpuinfo 2>/dev/null; then
-    warn "This doesn't look like a Raspberry Pi 4 (BCM2711 not found in cpuinfo)"
-    read -p "Continue anyway? (y/N) " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
-fi
+# ── System dependencies ───────────────────────────────────────────────────────
 
-# Check for BCM43455
-if ! lsmod | grep -q brcmfmac; then
-    warn "brcmfmac module not loaded — WiFi chip may not be detected"
-fi
+step "Installing system dependencies"
 
-log "Raspberry Pi 4 Model B detected"
-log "WiFi chip: BCM43455c0 (SDIO)"
-
-# ─── Configuration ────────────────────────────────────────────────────────────
-
-INSTALL_DIR="/opt/wivi-sentinel"
-NEXMON_DIR="/opt/nexmon"
-NEXMON_CSI_DIR="/opt/nexmon_csi"
-
-# Target Mac IP — the machine running the dashboard
-# This will be configurable later via the extractor config
-MAC_IP="${MAC_IP:-auto}"
-UDP_PORT="${UDP_PORT:-5500}"
-
-# WiFi channel to monitor (should match your router's channel)
-MONITOR_CHANNEL="${MONITOR_CHANNEL:-36}"
-MONITOR_BANDWIDTH="${MONITOR_BANDWIDTH:-80}"  # 20, 40, or 80 MHz
-
-# ─── Install dependencies ────────────────────────────────────────────────────
-
-log "Installing build dependencies..."
-apt-get update -qq
-apt-get install -y \
+sudo apt-get update -qq
+sudo apt-get install -y --no-install-recommends \
     git \
-    libgmp3-dev \
-    gawk \
-    qpdf \
-    bison \
-    flex \
-    make \
-    autoconf \
-    libtool \
-    texinfo \
-    automake \
-    build-essential \
-    libncurses5-dev \
+    curl \
     python3 \
     python3-pip \
-    tcpdump \
+    python3-venv \
+    python3-dev \
+    libgfortran5 \
+    libopenblas0 \
+    libpcap-dev \
+    avahi-daemon \
     iw \
     net-tools \
+    ca-certificates \
+    gnupg \
+    lsb-release \
     2>/dev/null
 
-# Python dependencies for the extractor and device scanner
-pip3 install numpy scipy zeroconf scapy --break-system-packages 2>/dev/null || pip3 install numpy scipy zeroconf scapy
+sudo systemctl enable --now avahi-daemon 2>/dev/null || true
 
-# ─── Get kernel headers ──────────────────────────────────────────────────────
+log "System dependencies installed"
 
-log "Installing kernel headers..."
-apt-get install -y raspberrypi-kernel-headers 2>/dev/null || {
-    warn "Could not install kernel headers via apt. Trying rpi-update method..."
-    KERNEL_VERSION=$(uname -r)
-    log "Running kernel: $KERNEL_VERSION"
-}
+# ── Docker ────────────────────────────────────────────────────────────────────
 
-# ─── Clone and build Nexmon ──────────────────────────────────────────────────
+if [ "$SKIP_DOCKER" != "true" ] && [ "$RUVIEW_ENABLED" = "true" ]; then
+    step "Installing Docker"
 
-log "Cloning Nexmon base framework..."
-if [ -d "$NEXMON_DIR" ]; then
-    warn "Nexmon directory exists, pulling latest..."
-    cd "$NEXMON_DIR" && git pull
+    if command -v docker &>/dev/null; then
+        info "Docker already installed: $(docker --version)"
+    else
+        info "Downloading Docker install script..."
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sudo sh /tmp/get-docker.sh
+        rm -f /tmp/get-docker.sh
+        log "Docker installed"
+    fi
+
+    # Add current user to docker group so we can run without sudo
+    if ! groups "$WIVI_USER" | grep -q docker; then
+        sudo usermod -aG docker "$WIVI_USER"
+        warn "Added $WIVI_USER to docker group — takes effect on next login"
+        warn "If Docker commands fail, log out and back in, then re-run: ./start.sh"
+        # For this session, use sg docker to inherit the group
+        DOCKER_CMD="sg docker -c docker"
+    else
+        DOCKER_CMD="docker"
+    fi
+
+    # Pull RuView image in the background so it's ready when start.sh runs
+    info "Pre-pulling RuView Docker image (background)..."
+    $DOCKER_CMD pull ruvnet/wifi-densepose:latest &>/dev/null &
+    RUVIEW_PULL_PID=$!
+    log "RuView image pull started in background (PID $RUVIEW_PULL_PID)"
+fi
+
+# ── Clone or update repository ────────────────────────────────────────────────
+
+step "Deploying Wi-Vi Sentinel"
+
+if [ -d "$WIVI_DIR/.git" ]; then
+    info "Repository exists — pulling latest changes..."
+    git -C "$WIVI_DIR" pull --rebase 2>/dev/null || warn "git pull failed, continuing with existing files"
+elif [ -d "$WIVI_DIR" ] && [ -f "$WIVI_DIR/server.py" ]; then
+    info "Found existing deployment in $WIVI_DIR (no git) — using as-is"
 else
-    git clone https://github.com/seemoo-lab/nexmon.git "$NEXMON_DIR"
+    info "Cloning from $WIVI_REPO..."
+    git clone "$WIVI_REPO" "$WIVI_DIR" || {
+        warn "git clone failed — creating directory and expecting manual file copy"
+        mkdir -p "$WIVI_DIR"
+    }
 fi
 
-cd "$NEXMON_DIR"
+cd "$WIVI_DIR"
 
-# Detect firmware version
-FIRMWARE_VERSION=$(strings /lib/firmware/brcm/brcmfmac43455-sdio.bin | grep -oP 'Version: [\d.]+' | head -1 || echo "")
-log "Current firmware: ${FIRMWARE_VERSION:-unknown}"
+# ── Python virtual environment ────────────────────────────────────────────────
 
-# Set up build environment
-log "Setting up Nexmon build environment (this takes ~10 minutes)..."
-source setup_env.sh
-cd buildtools
-make -j$(nproc) 2>/dev/null || make
-cd ..
+step "Setting up Python environment"
 
-# Build shared library
-cd utilities/libnexmon
-make -j$(nproc) 2>/dev/null || make
-cd ../..
+if [ ! -d "$WIVI_DIR/venv" ]; then
+    python3 -m venv "$WIVI_DIR/venv"
+    log "Created virtualenv at $WIVI_DIR/venv"
+fi
 
-# ─── Clone and build Nexmon CSI ──────────────────────────────────────────────
+source "$WIVI_DIR/venv/bin/activate"
 
-log "Cloning Nexmon CSI extractor..."
-if [ -d "$NEXMON_CSI_DIR" ]; then
-    warn "Nexmon CSI directory exists, pulling latest..."
-    cd "$NEXMON_CSI_DIR" && git pull
+pip install --upgrade pip --quiet
+pip install -r requirements.txt --quiet
+log "Python dependencies installed"
+
+deactivate
+
+# ── Configure .env ────────────────────────────────────────────────────────────
+
+step "Configuring environment"
+
+ENV_FILE="$WIVI_DIR/.env"
+
+if [ -f "$ENV_FILE" ]; then
+    info "Existing .env found — updating only missing values"
 else
-    git clone https://github.com/seemoo-lab/nexmon_csi.git "$NEXMON_CSI_DIR"
+    cp "$WIVI_DIR/.env.example" "$ENV_FILE" 2>/dev/null || touch "$ENV_FILE"
+    info "Created .env from template"
 fi
 
-cd "$NEXMON_CSI_DIR"
+# Helper: set or replace a key in .env
+set_env() {
+    local key="$1" val="$2"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+    else
+        echo "${key}=${val}" >> "$ENV_FILE"
+    fi
+}
 
-# Build the CSI patched firmware for BCM43455c0
-log "Building CSI-patched firmware for BCM43455c0..."
-cd patches/bcm43455c0/7_45_189/nexmon_csi/
+set_env FLASK_PORT     "$FLASK_PORT"
+set_env VITE_PORT      "$VITE_PORT"
+set_env CSI_SOURCE     "$CSI_SOURCE"
+set_env ESP32_SERIAL_PORT "$ESP32_SERIAL_PORT"
+set_env ESP32_BAUD_RATE   "$ESP32_BAUD_RATE"
+set_env RUVIEW_PORT    "$RUVIEW_PORT"
+set_env RUVIEW_URL     "http://localhost:${RUVIEW_PORT}"
+set_env RUVIEW_ENABLED "$RUVIEW_ENABLED"
 
-# Link Nexmon base
-export NEXMON_HOME="$NEXMON_DIR"
-source "$NEXMON_DIR/setup_env.sh"
+log ".env configured"
+info "  CSI_SOURCE=$CSI_SOURCE"
+info "  ESP32_SERIAL_PORT=$ESP32_SERIAL_PORT"
+info "  FLASK_PORT=$FLASK_PORT"
+info "  RUVIEW_PORT=$RUVIEW_PORT"
 
-make clean 2>/dev/null || true
-make -j$(nproc) 2>/dev/null || make
-make install
+# ── ESP32 serial port permissions ─────────────────────────────────────────────
 
-log "CSI-patched firmware installed"
+step "Configuring ESP32 serial access"
 
-# ─── Backup original firmware ────────────────────────────────────────────────
-
-FIRMWARE_PATH="/lib/firmware/brcm/brcmfmac43455-sdio.bin"
-BACKUP_PATH="${FIRMWARE_PATH}.original"
-
-if [ ! -f "$BACKUP_PATH" ]; then
-    log "Backing up original firmware to ${BACKUP_PATH}"
-    cp "$FIRMWARE_PATH" "$BACKUP_PATH"
+if [ -e "$ESP32_SERIAL_PORT" ]; then
+    log "ESP32 detected at $ESP32_SERIAL_PORT"
+    sudo usermod -aG dialout "$WIVI_USER" 2>/dev/null || true
+    sudo chmod 666 "$ESP32_SERIAL_PORT" 2>/dev/null || true
+    log "Serial port permissions set"
+else
+    warn "ESP32 not found at $ESP32_SERIAL_PORT"
+    warn "Plug the ESP32 into a USB port and verify: ls /dev/ttyUSB*"
 fi
 
-# ─── Install sentinel extractor ──────────────────────────────────────────────
+# ── Data directory ────────────────────────────────────────────────────────────
 
-log "Installing Wi-Vi Sentinel CSI extractor..."
-mkdir -p "$INSTALL_DIR"
+step "Setting up data directory"
 
-# Copy extractor scripts
-cp /tmp/wivi_pi_files/csi_extractor.py "$INSTALL_DIR/" 2>/dev/null || {
-    warn "Extractor script not found in /tmp/wivi_pi_files/"
-    warn "Copy csi_extractor.py to $INSTALL_DIR/ manually"
-}
+mkdir -p "$WIVI_DIR/data"
+if [ ! -f "$WIVI_DIR/data/profiles.json" ]; then
+    echo '{}' > "$WIVI_DIR/data/profiles.json"
+    log "Created empty profiles.json"
+fi
 
-# Create config file
-cat > "$INSTALL_DIR/config.json" << EOF
-{
-    "mac_ip": "${MAC_IP}",
-    "udp_port": ${UDP_PORT},
-    "monitor_channel": ${MONITOR_CHANNEL},
-    "bandwidth": ${MONITOR_BANDWIDTH},
-    "interface": "wlan0",
-    "sample_rate": 100,
-    "auto_discover_mac": true,
-    "log_level": "INFO"
-}
-EOF
+# ── Check for pre-built dashboard ─────────────────────────────────────────────
 
-# ─── Create systemd service ──────────────────────────────────────────────────
+step "Dashboard"
 
-log "Creating systemd service..."
-cat > /etc/systemd/system/wivi-csi.service << EOF
+if [ -f "$WIVI_DIR/dist/index.html" ]; then
+    log "Pre-built dashboard found at dist/index.html"
+else
+    warn "dist/index.html not found"
+    warn "Build the dashboard on a machine with Node >=18:"
+    warn "  npm install && npm run build"
+    warn "Then copy dist/ to $WIVI_DIR/dist/ on this Pi:"
+    warn "  rsync -av dist/ ${WIVI_USER}@$(hostname -I | awk '{print $1}'):$WIVI_DIR/dist/"
+    warn "Falling back to legacy CDN dashboard (index.legacy.html) until dist/ is available"
+fi
+
+# ── Systemd service ───────────────────────────────────────────────────────────
+
+if [ "$SKIP_SYSTEMD" != "true" ]; then
+    step "Creating systemd service"
+
+    ACTIVATE_CMD="source $WIVI_DIR/venv/bin/activate"
+    START_CMD="python3 $WIVI_DIR/server.py"
+
+    sudo tee /etc/systemd/system/wivi-sentinel.service > /dev/null << EOF
 [Unit]
-Description=Wi-Vi Sentinel CSI Extractor
-After=network.target
+Description=Wi-Vi Sentinel — WiFi CSI Biometric Detection
+Documentation=https://github.com/YOUR_USER/wivi-sentinel
+After=network-online.target docker.service
 Wants=network-online.target
+Requires=wivi-ruview.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 5
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/csi_extractor.py --config ${INSTALL_DIR}/config.json
-Restart=always
+User=${WIVI_USER}
+WorkingDirectory=${WIVI_DIR}
+EnvironmentFile=${WIVI_DIR}/.env
+ExecStartPre=/bin/sleep 3
+ExecStart=${WIVI_DIR}/venv/bin/python3 ${WIVI_DIR}/server.py
+Restart=on-failure
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    if [ "$RUVIEW_ENABLED" = "true" ] && [ "$SKIP_DOCKER" != "true" ]; then
+        sudo tee /etc/systemd/system/wivi-ruview.service > /dev/null << EOF
+[Unit]
+Description=Wi-Vi Sentinel — RuView Pose Estimation (Docker)
+Documentation=https://github.com/ruvnet/RuView
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=${WIVI_USER}
+Restart=on-failure
+RestartSec=10
+ExecStartPre=-/usr/bin/docker rm -f wivi-ruview
+ExecStart=/usr/bin/docker run --rm \
+    --name wivi-ruview \
+    -p ${RUVIEW_PORT}:3000 \
+    -p 5005:5005/udp \
+    -e CSI_SOURCE=simulated \
+    ruvnet/wifi-densepose:latest
+ExecStop=/usr/bin/docker stop wivi-ruview
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-systemctl daemon-reload
-
-# ─── Create monitor mode helper script ───────────────────────────────────────
-
-cat > "$INSTALL_DIR/start_monitor.sh" << 'MONITOR_SCRIPT'
-#!/usr/bin/env bash
-# Bring wlan0 into monitor mode with Nexmon CSI firmware
-
-CHANNEL=${1:-36}
-BANDWIDTH=${2:-80}
-
-set -e
-
-echo "[SENTINEL] Configuring monitor mode on wlan0..."
-
-# Unload and reload with patched firmware
-ifconfig wlan0 down 2>/dev/null || true
-rmmod brcmfmac 2>/dev/null || true
-sleep 1
-modprobe brcmfmac
-
-# Wait for interface
-for i in $(seq 1 10); do
-    if iw dev wlan0 info >/dev/null 2>&1; then
-        break
+        log "Created wivi-ruview.service"
     fi
-    sleep 1
-done
 
-# Set monitor mode
-iw dev wlan0 interface add mon0 type monitor 2>/dev/null || {
-    ip link set wlan0 down
-    iw dev wlan0 set type monitor
-    ip link set wlan0 up
-}
+    sudo systemctl daemon-reload
+    sudo systemctl enable wivi-sentinel.service 2>/dev/null || true
+    [ "$RUVIEW_ENABLED" = "true" ] && sudo systemctl enable wivi-ruview.service 2>/dev/null || true
 
-# If mon0 was created, use that; otherwise wlan0 is in monitor mode
-if iw dev mon0 info >/dev/null 2>&1; then
-    IFACE="mon0"
-    ip link set mon0 up
-else
-    IFACE="wlan0"
-    ip link set wlan0 up
+    log "Systemd services enabled (start on boot)"
 fi
 
-# Set channel and bandwidth
-# Nexmon uses chanspec format for bandwidth control
-case $BANDWIDTH in
-    20) BW_FLAG="" ;;
-    40) BW_FLAG="HT40+" ;;
-    80) BW_FLAG="80MHz" ;;
-    *) BW_FLAG="" ;;
-esac
+# ── Convenience CLI commands ──────────────────────────────────────────────────
 
-iw dev $IFACE set channel $CHANNEL $BW_FLAG 2>/dev/null || {
-    echo "[SENTINEL] Warning: Could not set channel $CHANNEL $BW_FLAG"
-    echo "[SENTINEL] Trying nexutil..."
-    # Use nexutil for chanspec (Nexmon-specific)
-    # chanspec encoding: channel | (bandwidth << 8)
-    if command -v nexutil &>/dev/null; then
-        nexutil -Iwlan0 -s500 -b -l34 \
-            -v$(python3 -c "import struct; print(struct.pack('<IIBBHHBBBBBBBBBBBBBBBBBBBBBBBBBB', $CHANNEL, 0, 0, 0, 0, 0, *([0]*26)).hex())")
-    fi
-}
+step "Installing CLI commands"
 
-echo "[SENTINEL] Monitor mode active on $IFACE, channel $CHANNEL, bandwidth ${BANDWIDTH}MHz"
-MONITOR_SCRIPT
-
-chmod +x "$INSTALL_DIR/start_monitor.sh"
-
-# ─── Create convenience scripts ──────────────────────────────────────────────
-
-cat > /usr/local/bin/wivi-start << EOF
-#!/bin/bash
-echo "Starting Wi-Vi Sentinel CSI extraction..."
-sudo ${INSTALL_DIR}/start_monitor.sh ${MONITOR_CHANNEL} ${MONITOR_BANDWIDTH}
-sudo systemctl start wivi-csi
-echo "Streaming CSI to ${MAC_IP}:${UDP_PORT}"
-echo "Monitor with: sudo journalctl -u wivi-csi -f"
+sudo tee /usr/local/bin/wivi-start > /dev/null << EOF
+#!/usr/bin/env bash
+# Start Wi-Vi Sentinel (and RuView if enabled)
+cd ${WIVI_DIR}
+exec ./start.sh "\$@"
 EOF
 
-cat > /usr/local/bin/wivi-stop << EOF
-#!/bin/bash
+sudo tee /usr/local/bin/wivi-stop > /dev/null << EOF
+#!/usr/bin/env bash
 echo "Stopping Wi-Vi Sentinel..."
-sudo systemctl stop wivi-csi
-sudo ifconfig wlan0 down 2>/dev/null
-sudo rmmod brcmfmac 2>/dev/null
-sudo modprobe brcmfmac
-echo "Stopped. Normal WiFi restored."
+sudo systemctl stop wivi-sentinel 2>/dev/null || true
+sudo systemctl stop wivi-ruview   2>/dev/null || true
+docker stop wivi-ruview 2>/dev/null || true
+echo "Stopped."
 EOF
 
-cat > /usr/local/bin/wivi-status << EOF
-#!/bin/bash
-echo "=== Wi-Vi Sentinel Status ==="
+sudo tee /usr/local/bin/wivi-status > /dev/null << STATUSEOF
+#!/usr/bin/env bash
+echo "═══════════════════════════════════════════"
+echo "  Wi-Vi Sentinel Status"
+echo "═══════════════════════════════════════════"
 echo ""
-echo "Service:"
-systemctl is-active wivi-csi 2>/dev/null || echo "  not running"
+echo "── Services ──"
+systemctl is-active wivi-sentinel 2>/dev/null && echo "  sentinel: RUNNING" || echo "  sentinel: STOPPED"
+systemctl is-active wivi-ruview   2>/dev/null && echo "  ruview:   RUNNING" || echo "  ruview:   STOPPED"
 echo ""
-echo "Interface:"
-iw dev wlan0 info 2>/dev/null || echo "  wlan0 not available"
+echo "── ESP32 ──"
+ls /dev/ttyUSB* 2>/dev/null || echo "  No USB serial devices found"
 echo ""
-echo "Config:"
-cat ${INSTALL_DIR}/config.json 2>/dev/null
+echo "── Dashboard ──"
+PI_IP=\$(hostname -I | awk '{print \$1}')
+echo "  http://\${PI_IP}:${FLASK_PORT}"
+echo "  http://\${PI_IP}:${FLASK_PORT}/api/status"
 echo ""
-echo "Recent logs:"
-journalctl -u wivi-csi --no-pager -n 10 2>/dev/null
-EOF
+echo "── RuView ──"
+echo "  http://\${PI_IP}:${RUVIEW_PORT}/ui/observatory.html"
+echo ""
+echo "── Logs ──"
+echo "  journalctl -u wivi-sentinel -f"
+echo "  journalctl -u wivi-ruview -f"
+STATUSEOF
 
-chmod +x /usr/local/bin/wivi-start
-chmod +x /usr/local/bin/wivi-stop
-chmod +x /usr/local/bin/wivi-status
+sudo chmod +x /usr/local/bin/wivi-start \
+              /usr/local/bin/wivi-stop  \
+              /usr/local/bin/wivi-status
 
-# ─── Final summary ───────────────────────────────────────────────────────────
+log "Commands installed: wivi-start, wivi-stop, wivi-status"
+
+# ── Wait for RuView image pull (if started) ───────────────────────────────────
+
+if [ -n "${RUVIEW_PULL_PID:-}" ]; then
+    step "Waiting for RuView image pull to complete"
+    wait "$RUVIEW_PULL_PID" && log "RuView image ready" || warn "RuView image pull may have failed — will retry on first start"
+fi
+
+# ── Auto-start ────────────────────────────────────────────────────────────────
+
+step "Starting services"
+
+if [ "$SKIP_SYSTEMD" = "true" ]; then
+    info "SKIP_SYSTEMD=true — not starting services automatically"
+    info "Run manually: cd $WIVI_DIR && ./start.sh"
+else
+    if [ "$RUVIEW_ENABLED" = "true" ] && [ "$SKIP_DOCKER" != "true" ]; then
+        sudo systemctl start wivi-ruview 2>/dev/null || warn "wivi-ruview failed to start (check: journalctl -u wivi-ruview)"
+    fi
+
+    if [ -f "$WIVI_DIR/dist/index.html" ] || [ -f "$WIVI_DIR/index.legacy.html" ]; then
+        sudo systemctl start wivi-sentinel 2>/dev/null || warn "wivi-sentinel failed to start (check: journalctl -u wivi-sentinel)"
+    else
+        warn "Skipping sentinel start — deploy dist/ first"
+    fi
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<pi-ip>")
 
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}  Wi-Vi Sentinel — Pi 4 Setup Complete${NC}"
+echo -e "${GREEN}  Wi-Vi Sentinel Setup Complete${NC}"
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  ${YELLOW}Before first run:${NC}"
+echo -e "  ${BOLD}Dashboard:${NC}  http://${PI_IP}:${FLASK_PORT}"
+echo -e "  ${BOLD}API:${NC}        http://${PI_IP}:${FLASK_PORT}/api/status"
+[ "$RUVIEW_ENABLED" = "true" ] && \
+echo -e "  ${BOLD}RuView:${NC}     http://${PI_IP}:${RUVIEW_PORT}/ui/observatory.html"
 echo ""
-echo -e "  1. Copy ${CYAN}csi_extractor.py${NC} to ${INSTALL_DIR}/"
-echo -e "  2. Edit ${CYAN}${INSTALL_DIR}/config.json${NC}:"
-echo -e "     - Set ${YELLOW}mac_ip${NC} to your Mac's local IP (e.g. 192.168.1.71)"
-echo -e "     - Set ${YELLOW}monitor_channel${NC} to your router's WiFi channel"
-echo -e "       (find it with: ${CYAN}sudo iwlist wlan0 channel${NC})"
-echo -e "     - Set ${YELLOW}bandwidth${NC} to 20, 40, or 80"
+echo -e "  ${YELLOW}CLI Commands:${NC}"
+echo -e "  ${CYAN}wivi-start${NC}   — start all services"
+echo -e "  ${CYAN}wivi-stop${NC}    — stop all services"
+echo -e "  ${CYAN}wivi-status${NC}  — show status, IPs, and log commands"
 echo ""
-echo -e "  ${YELLOW}Commands:${NC}"
-echo -e "  ${CYAN}wivi-start${NC}    — Start CSI extraction + UDP streaming"
-echo -e "  ${CYAN}wivi-stop${NC}     — Stop and restore normal WiFi"
-echo -e "  ${CYAN}wivi-status${NC}   — Check service status and recent logs"
-echo ""
-echo -e "  ${YELLOW}Note:${NC} When monitor mode is active, the Pi's onboard WiFi"
-echo -e "  cannot connect to your network. Use Ethernet for SSH/network."
-echo -e "  Plug in an Ethernet cable before running ${CYAN}wivi-start${NC}."
-echo ""
+
+if ! [ -f "$WIVI_DIR/dist/index.html" ]; then
+    echo -e "  ${YELLOW}⚠ ACTION REQUIRED:${NC} Deploy the pre-built dashboard:"
+    echo -e "  On your Mac: ${CYAN}npm run build${NC}"
+    echo -e "  Then:        ${CYAN}rsync -av dist/ ${WIVI_USER}@${PI_IP}:${WIVI_DIR}/dist/${NC}"
+    echo ""
+fi
+
+if ! [ -e "$ESP32_SERIAL_PORT" ]; then
+    echo -e "  ${YELLOW}⚠ ACTION REQUIRED:${NC} ESP32 not detected at ${ESP32_SERIAL_PORT}"
+    echo -e "  Plug in the ESP32 and verify: ${CYAN}ls /dev/ttyUSB*${NC}"
+    echo ""
+fi
+
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
