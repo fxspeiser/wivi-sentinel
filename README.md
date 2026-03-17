@@ -44,7 +44,8 @@ Passive through-wall sensing using an ESP32 + Raspberry Pi 4.
 The ESP32 must be flashed from a machine with a USB port running macOS or Linux (not the Pi itself).
 
 ```bash
-chmod +x setup_esp32.sh
+git clone https://github.com/YOUR_USER/wivi-sentinel.git
+cd wivi-sentinel
 
 # With prompts:
 ./setup_esp32.sh
@@ -108,19 +109,13 @@ Open `http://<pi-ip>:5555` in your browser.
 
 ## Deploying Updates
 
-All code updates deploy via git — no file syncing needed.
+When a new version is published to GitHub, update the Pi with:
 
-**On your development machine:**
-```bash
-git add . && git commit -m "your changes" && git push
-```
-
-**On the Pi:**
 ```bash
 cd ~/wivi-sentinel && git pull && ./start.sh restart
 ```
 
-That's it. `dist/` (the pre-built dashboard) is committed to the repo so the Pi always gets the latest UI on pull.
+`dist/` (the pre-built dashboard) is committed to the repo so the Pi always gets the latest UI on pull.
 
 ---
 
@@ -142,25 +137,27 @@ That's it. `dist/` (the pre-built dashboard) is committed to the repo so the Pi 
 PI_IP=<from user>             # find with: ping raspberrypi.local or check router DHCP
 PI_USER=<from user>           # the username set in Raspberry Pi Imager
 PI_PASS=<from user>           # for sudo operations
-REPO_DIR=<path on host>       # local clone of this repo, e.g. /home/user/wivi-sentinel
 WIFI_SSID=<from user>         # ESP32 must join a 2.4 GHz network
 WIFI_PASSWORD=<from user>
 ```
 
 ---
 
-### Phase 1 — Flash the ESP32 (run on host machine, not the Pi)
+### Phase 1 — Flash the ESP32 (run on Mac/Linux, not the Pi)
+
+Clone the repo on the machine connected to the ESP32 via USB, then flash:
 
 **1.1 Flash firmware**
 ```bash
-cd "$REPO_DIR"
+git clone https://github.com/YOUR_USER/wivi-sentinel.git
+cd wivi-sentinel
 WIFI_SSID="$WIFI_SSID" WIFI_PASSWORD="$WIFI_PASSWORD" ./setup_esp32.sh
 ```
 Expected: script exits with "Flash complete" or similar success message.
 
 **1.2 Verify ESP32 is streaming CSI**
 ```bash
-# Plug ESP32 into host USB first
+# Plug ESP32 into USB first
 PORT=$(ls /dev/cu.usbserial-* 2>/dev/null | head -1)
 timeout 5 cat "$PORT" 2>/dev/null | grep -c "CSI_DATA" || echo "no CSI data yet"
 ```
@@ -267,13 +264,9 @@ http://${PI_IP}:5555
 
 ### Automated re-deploy (subsequent updates)
 
-Push code changes from your development machine, then pull on the Pi:
+When a new version is published, pull and restart on the Pi:
 
 ```bash
-# On your development machine:
-git add . && git commit -m "update" && git push
-
-# On the Pi:
 ssh ${PI_USER}@${PI_IP} "cd ~/wivi-sentinel && git pull && ./start.sh restart"
 ```
 
