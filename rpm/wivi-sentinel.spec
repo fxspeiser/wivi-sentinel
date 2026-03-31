@@ -203,7 +203,7 @@ fi
 %{_tmpfilesdir}/%{name}.conf
 
 %changelog
-* Mon Mar 31 2026 Wi-Vi Sentinel <sentinel@wivi.local> - 2.0.0-1
+* Tue Mar 31 2026 Wi-Vi Sentinel <sentinel@wivi.local> - 2.0.0-1
 - Initial RPM release with interactive WiFi setup wizard
 - Bundled pre-built React dashboard
 - ESP32 CSI auto-detection
