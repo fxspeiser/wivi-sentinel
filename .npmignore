@@ -1,0 +1,23 @@
+# Dev / build only
+node_modules/
+src/
+firmware/
+rpm/
+.github/
+__pycache__/
+*.pyc
+
+# Local state
+.env
+data/profiles.json
+venv/
+.venv/
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Misc
+.git/
+*.md
+!.env.example

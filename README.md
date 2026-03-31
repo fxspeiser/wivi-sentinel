@@ -287,6 +287,38 @@ ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh restart"
 
 ---
 
+## npm Package (GitHub Packages)
+
+Install anywhere with Node.js and Python 3:
+
+```bash
+# Authenticate with GitHub Packages (one-time)
+npm login --registry=https://npm.pkg.github.com --scope=@fxspeiser
+
+# Install globally
+npm install -g @fxspeiser/wivi-sentinel --registry=https://npm.pkg.github.com
+
+# Or via .npmrc (add to ~/.npmrc or project .npmrc):
+#   //npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
+#   @fxspeiser:registry=https://npm.pkg.github.com
+```
+
+Then set up and run:
+
+```bash
+wivi-sentinel setup    # Installs Python venv, detects ESP32, writes config
+wivi-sentinel start    # Starts the server
+wivi-sentinel status   # Check if running + ESP32 connection
+```
+
+Files install to `~/wivi-sentinel` by default. Override with `WIVI_DIR`:
+
+```bash
+WIVI_DIR=/opt/wivi-sentinel wivi-sentinel setup
+```
+
+---
+
 ## RPM Package (Fedora / RHEL / CentOS)
 
 For RPM-based systems, a self-contained package with an interactive setup wizard is available.

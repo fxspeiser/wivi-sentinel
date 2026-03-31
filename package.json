@@ -1,12 +1,34 @@
 {
-  "name": "wivi-sentinel-dashboard",
-  "version": "1.0.0",
-  "private": true,
+  "name": "@fxspeiser/wivi-sentinel",
+  "version": "2.0.0",
+  "description": "WiFi CSI biometric detection, classification, and tracking",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "python3 server.py",
+    "postinstall": "echo '\\nRun: npx @fxspeiser/wivi-sentinel setup\\n'"
   },
+  "bin": {
+    "wivi-sentinel": "./bin/wivi-sentinel.js"
+  },
+  "files": [
+    "server.py",
+    "requirements.txt",
+    "start.sh",
+    "engine/",
+    "dist/",
+    "bin/",
+    ".env.example"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fxspeiser/wivi-sentinel.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "license": "MIT",
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
