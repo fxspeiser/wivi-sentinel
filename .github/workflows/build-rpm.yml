@@ -22,7 +22,7 @@ jobs:
     steps:
       - name: Install build tools
         run: |
-          dnf install -y rpm-build rpmdevtools git tar gzip python3-devel
+          dnf install -y rpm-build rpmdevtools git tar gzip python3-devel systemd-rpm-macros
 
       - name: Checkout
         uses: actions/checkout@v4
