@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Wi-Vi Sentinel</short>
+  <description>Wi-Vi Sentinel dashboard and API server</description>
+  <port protocol="tcp" port="5555"/>
+</service>

@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wi-Vi Sentinel — First-Run Setup Wizard
+# ═══════════════════════════════════════════════════════════════════════════════
+# Interactive wizard that runs after RPM install (or on demand).
+# Walks the user through WiFi configuration, ESP32 detection, and service start.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+WIVI_DIR="/opt/wivi-sentinel"
+WIVI_USER="wivi-sentinel"
+ENV_FILE="$WIVI_DIR/.env"
+FLASK_PORT=5555
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+banner() {
+    clear
+    echo -e "${CYAN}"
+    echo "  ╦ ╦┬ ╦┬  ╦┬  ╔═╗┌─┐┌┐┌┌┬┐┬┌┐┌┌─┐┬  "
+    echo "  ║║║│─┤╚╗╔╝│  ╚═╗├┤ │││ │ ││││├┤ │  "
+    echo "  ╚╩╝┴ ┴ ╚╝ ┴  ╚═╝└─┘┘└┘ ┴ ┴┘└┘└─┘┴─┘"
+    echo -e "${NC}"
+    echo -e "  ${DIM}WiFi CSI Biometric Detection System${NC}"
+    echo ""
+}
+
+log()  { echo -e "  ${GREEN}✓${NC} $*"; }
+info() { echo -e "  ${CYAN}→${NC} $*"; }
+warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+err()  { echo -e "  ${RED}✗${NC} $*"; }
+ask()  { echo -en "  ${BOLD}$*${NC} "; }
+
+divider() {
+    echo -e "  ${DIM}────────────────────────────────────────────────${NC}"
+}
+
+press_enter() {
+    echo ""
+    ask "Press Enter to continue..."
+    read -r
+}
+
+# ── Step 1: Welcome ──────────────────────────────────────────────────────────
+
+banner
+echo -e "  Welcome! This wizard will:"
+echo ""
+echo -e "  ${CYAN}1.${NC} Connect this device to your WiFi network"
+echo -e "  ${CYAN}2.${NC} Detect your ESP32 sensor (if plugged in)"
+echo -e "  ${CYAN}3.${NC} Start the Wi-Vi Sentinel server"
+echo -e "  ${CYAN}4.${NC} Give you the dashboard URL"
+echo ""
+divider
+
+press_enter
+
+# ── Step 2: WiFi ─────────────────────────────────────────────────────────────
+
+banner
+echo -e "  ${BOLD}Step 1 of 3: WiFi Configuration${NC}"
+echo ""
+divider
+
+# Check if already connected
+CURRENT_WIFI=""
+if command -v nmcli &>/dev/null; then
+    CURRENT_WIFI=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2 || true)
+fi
+
+if [ -n "$CURRENT_WIFI" ]; then
+    echo ""
+    log "Already connected to: ${BOLD}${CURRENT_WIFI}${NC}"
+    echo ""
+    ask "Keep this connection? [Y/n]: "
+    read -r KEEP_WIFI
+    if [[ "${KEEP_WIFI,,}" != "n" ]]; then
+        WIFI_SSID="$CURRENT_WIFI"
+        log "Keeping current WiFi connection"
+    else
+        CURRENT_WIFI=""
+    fi
+fi
+
+if [ -z "$CURRENT_WIFI" ]; then
+    # Scan for networks
+    info "Scanning for WiFi networks..."
+    echo ""
+
+    if ! command -v nmcli &>/dev/null; then
+        err "NetworkManager (nmcli) not found."
+        err "Install it with: sudo dnf install NetworkManager-wifi"
+        echo ""
+        warn "You can configure WiFi manually and re-run this wizard."
+        press_enter
+    else
+        # Trigger a fresh scan
+        nmcli dev wifi rescan 2>/dev/null || true
+        sleep 2
+
+        # List available networks, deduplicated, sorted by signal strength
+        NETWORKS=$(nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list | \
+                   awk -F: 'NF>=2 && $1!="" && !seen[$1]++ {printf "%-35s %3s%%  %s\n", $1, $2, $3}' | \
+                   head -20)
+
+        if [ -z "$NETWORKS" ]; then
+            warn "No WiFi networks found. Check that WiFi hardware is enabled."
+            press_enter
+        else
+            echo -e "  ${BOLD}Available networks:${NC}"
+            echo ""
+            echo "$NETWORKS" | nl -ba -w3 -s'  ' | sed 's/^/  /'
+            echo ""
+            divider
+            echo ""
+
+            ask "Enter the WiFi network name (SSID): "
+            read -r WIFI_SSID
+
+            if [ -z "$WIFI_SSID" ]; then
+                warn "No SSID entered — skipping WiFi setup"
+                press_enter
+            else
+                # Check if network needs a password
+                WIFI_SEC=$(nmcli -t -f SSID,SECURITY dev wifi list | grep "^${WIFI_SSID}:" | head -1 | cut -d: -f2)
+
+                WIFI_PASSWORD=""
+                if [ -n "$WIFI_SEC" ] && [ "$WIFI_SEC" != "--" ] && [ "$WIFI_SEC" != "" ]; then
+                    echo ""
+                    ask "Enter WiFi password: "
+                    read -rs WIFI_PASSWORD
+                    echo ""
+                fi
+
+                echo ""
+                info "Connecting to ${BOLD}${WIFI_SSID}${NC}..."
+
+                if [ -n "$WIFI_PASSWORD" ]; then
+                    nmcli dev wifi connect "$WIFI_SSID" password "$WIFI_PASSWORD" 2>&1 | sed 's/^/  /' || {
+                        err "Failed to connect. Check your password and try again."
+                        press_enter
+                        WIFI_SSID=""
+                    }
+                else
+                    nmcli dev wifi connect "$WIFI_SSID" 2>&1 | sed 's/^/  /' || {
+                        err "Failed to connect."
+                        press_enter
+                        WIFI_SSID=""
+                    }
+                fi
+
+                if [ -n "$WIFI_SSID" ]; then
+                    # Wait for IP
+                    sleep 2
+                    log "Connected to ${BOLD}${WIFI_SSID}${NC}"
+                fi
+            fi
+        fi
+    fi
+fi
+
+# ── Step 3: ESP32 detection ──────────────────────────────────────────────────
+
+banner
+echo -e "  ${BOLD}Step 2 of 3: ESP32 Sensor${NC}"
+echo ""
+divider
+echo ""
+
+ESP32_PORT=""
+
+# Look for USB serial devices
+USB_DEVICES=$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true)
+
+if [ -n "$USB_DEVICES" ]; then
+    log "USB serial device(s) detected:"
+    echo ""
+    echo "$USB_DEVICES" | nl -ba -w3 -s'  ' | sed 's/^/    /'
+    echo ""
+
+    # Default to first found
+    DEFAULT_PORT=$(echo "$USB_DEVICES" | head -1)
+    ask "ESP32 serial port [${DEFAULT_PORT}]: "
+    read -r USER_PORT
+    ESP32_PORT="${USER_PORT:-$DEFAULT_PORT}"
+
+    log "Using ${BOLD}${ESP32_PORT}${NC}"
+else
+    warn "No USB serial devices found."
+    echo ""
+    echo -e "  ${DIM}If your ESP32 is not plugged in yet, that's fine.${NC}"
+    echo -e "  ${DIM}Plug it in later and run: ${CYAN}wivi-sentinel-setup${NC}"
+    echo ""
+
+    ESP32_PORT="/dev/ttyUSB0"
+    info "Defaulting to ${ESP32_PORT} (will auto-retry when plugged in)"
+fi
+
+# Set CSI source mode
+if [ -n "$USB_DEVICES" ]; then
+    CSI_SOURCE="esp32"
+else
+    echo ""
+    ask "Run in demo mode (simulated data) until ESP32 is connected? [Y/n]: "
+    read -r USE_SIM
+    if [[ "${USE_SIM,,}" == "n" ]]; then
+        CSI_SOURCE="esp32"
+        info "Will wait for ESP32 on startup"
+    else
+        CSI_SOURCE="simulated"
+        log "Starting in demo mode"
+    fi
+fi
+
+# ── Step 4: Write config ─────────────────────────────────────────────────────
+
+banner
+echo -e "  ${BOLD}Step 3 of 3: Configuring & Starting${NC}"
+echo ""
+divider
+echo ""
+
+info "Writing configuration..."
+
+# Write .env
+cat > "$ENV_FILE" << ENVEOF
+# Wi-Vi Sentinel — auto-generated by setup wizard
+FLASK_PORT=${FLASK_PORT}
+VITE_PORT=3000
+CSI_SOURCE=${CSI_SOURCE}
+ESP32_SERIAL_PORT=${ESP32_PORT}
+ESP32_BAUD_RATE=921600
+PROBE_IFACE=
+ENVEOF
+
+# Ensure data dir and profiles
+mkdir -p "$WIVI_DIR/data"
+[ -f "$WIVI_DIR/data/profiles.json" ] || echo '{}' > "$WIVI_DIR/data/profiles.json"
+chown -R "$WIVI_USER:$WIVI_USER" "$WIVI_DIR/data" 2>/dev/null || true
+chown "$WIVI_USER:$WIVI_USER" "$ENV_FILE" 2>/dev/null || true
+
+log "Configuration saved"
+
+# ── Start the service ────────────────────────────────────────────────────────
+
+info "Starting Wi-Vi Sentinel..."
+echo ""
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable wivi-sentinel.service 2>/dev/null || true
+systemctl restart wivi-sentinel.service 2>/dev/null || {
+    err "Service failed to start. Check: journalctl -u wivi-sentinel -n 30"
+}
+
+# Wait for it to come up
+sleep 3
+
+STATUS=$(systemctl is-active wivi-sentinel 2>/dev/null || echo "unknown")
+
+# ── Get the device IP ────────────────────────────────────────────────────────
+
+DEVICE_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+
+# ── If we have WiFi creds and ESP32, push them to the ESP32 ──────────────────
+
+if [ "$CSI_SOURCE" = "esp32" ] && [ -n "${WIFI_SSID:-}" ] && [ -n "${WIFI_PASSWORD:-}" ]; then
+    sleep 2
+    curl -s -X POST "http://127.0.0.1:${FLASK_PORT}/api/esp32/wifi" \
+         -H "Content-Type: application/json" \
+         -d "{\"ssid\":\"${WIFI_SSID}\",\"password\":\"${WIFI_PASSWORD}\"}" \
+         >/dev/null 2>&1 || true
+    log "WiFi credentials sent to ESP32"
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+banner
+echo -e "  ${GREEN}${BOLD}Setup Complete!${NC}"
+echo ""
+divider
+echo ""
+
+if [ "$STATUS" = "active" ]; then
+    log "Service is ${GREEN}running${NC}"
+else
+    warn "Service status: ${STATUS}"
+    echo -e "  ${DIM}Check logs: journalctl -u wivi-sentinel -f${NC}"
+fi
+
+echo ""
+echo -e "  ${BOLD}Dashboard:${NC}  ${CYAN}http://${DEVICE_IP}:${FLASK_PORT}${NC}"
+echo -e "  ${BOLD}API:${NC}        ${CYAN}http://${DEVICE_IP}:${FLASK_PORT}/api/status${NC}"
+echo ""
+divider
+echo ""
+echo -e "  ${BOLD}Useful commands:${NC}"
+echo -e "    ${CYAN}wivi-sentinel-setup${NC}    Re-run this wizard"
+echo -e "    ${CYAN}systemctl status wivi-sentinel${NC}"
+echo -e "    ${CYAN}journalctl -u wivi-sentinel -f${NC}"
+echo ""
+
+if [ "$CSI_SOURCE" = "simulated" ]; then
+    echo -e "  ${YELLOW}Note:${NC} Running in demo mode. Plug in your ESP32 and"
+    echo -e "  re-run ${CYAN}wivi-sentinel-setup${NC} to switch to live data."
+    echo ""
+fi
+
+echo -e "  Open ${CYAN}http://${DEVICE_IP}:${FLASK_PORT}${NC} in any browser"
+echo -e "  on the same network to view the dashboard."
+echo ""

@@ -1,0 +1,32 @@
+[Unit]
+Description=Wi-Vi Sentinel — WiFi CSI Biometric Detection
+Documentation=https://github.com/YOUR_USER/wivi-sentinel
+After=network-online.target NetworkManager-wait-online.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wivi-sentinel
+Group=wivi-sentinel
+WorkingDirectory=/opt/wivi-sentinel
+EnvironmentFile=-/opt/wivi-sentinel/.env
+ExecStartPre=/bin/sleep 3
+ExecStart=/opt/wivi-sentinel/venv/bin/python3 /opt/wivi-sentinel/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/opt/wivi-sentinel/data
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+# ESP32 serial access
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target

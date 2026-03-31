@@ -1,0 +1,68 @@
+name: Build RPM Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g. 2.0.1)'
+        required: false
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y rpm-build rpmdevtools git tar gzip
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure dashboard is built
+        run: |
+          if [ ! -f dist/index.html ]; then
+            echo "::error::dist/index.html not found — commit the pre-built dashboard first"
+            exit 1
+          fi
+
+      - name: Set version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER="2.0.0"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # Patch the spec file with the correct version
+          sed -i "s/^Version:.*/Version:        $VER/" rpm/wivi-sentinel.spec
+
+      - name: Build RPM
+        run: |
+          chmod +x rpm/build-rpm.sh
+          rpm/build-rpm.sh
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wivi-sentinel-${{ steps.version.outputs.version }}.noarch.rpm
+          path: wivi-sentinel-*.noarch.rpm
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: wivi-sentinel-*.noarch.rpm
+          asset_name: wivi-sentinel-${{ steps.version.outputs.version }}-1.noarch.rpm
+          asset_content_type: application/x-rpm

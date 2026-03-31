@@ -287,6 +287,50 @@ ssh ${PI_USER}@${PI_IP} "~/wivi-sentinel/start.sh restart"
 
 ---
 
+## RPM Package (Fedora / RHEL / CentOS)
+
+For RPM-based systems, a self-contained package with an interactive setup wizard is available.
+
+### Install
+
+```bash
+# Download the latest RPM from GitHub Releases (or build it yourself)
+sudo dnf install ./wivi-sentinel-2.0.0-1.noarch.rpm
+```
+
+### Run the setup wizard
+
+```bash
+sudo wivi-sentinel-setup
+```
+
+The wizard walks you through:
+1. **WiFi** — scans available networks, connects via NetworkManager
+2. **ESP32** — auto-detects USB serial devices (or starts in demo mode)
+3. **Start** — writes config, enables the systemd service, prints the dashboard URL
+
+The RPM handles everything: Python venv, firewall port, service user, serial permissions, and auto-start on boot. Profile data at `/opt/wivi-sentinel/data/` is preserved across upgrades and uninstalls.
+
+### Build the RPM yourself
+
+Requires a Fedora/RHEL machine (or use the GitHub Actions workflow):
+
+```bash
+sudo dnf install rpm-build rpmdevtools
+./rpm/build-rpm.sh
+# Output: wivi-sentinel-2.0.0-1.noarch.rpm
+```
+
+Or push a version tag to trigger the CI build:
+
+```bash
+git tag v2.0.0
+git push origin v2.0.0
+# → GitHub Actions builds the RPM and attaches it to the Release
+```
+
+---
+
 ## Docker Mode (alternative to systemd)
 
 Run the full stack in Docker Compose (ESP32 USB passthrough required):
@@ -418,6 +462,13 @@ wivi-sentinel/
 │   ├── nexmon_source.py    # Nexmon CSI source (UDP, legacy)
 │   ├── device_scanner.py   # mDNS + probe request device discovery
 │   └── csi_collector.py    # CSI frame collection utilities
+├── rpm/
+│   ├── wivi-sentinel.spec  # RPM package spec
+│   ├── wivi-sentinel-setup # Interactive WiFi + ESP32 setup wizard
+│   ├── wivi-sentinel.service # Hardened systemd unit for RPM installs
+│   └── build-rpm.sh        # Builds the .noarch.rpm
+├── .github/workflows/
+│   └── build-rpm.yml       # CI: builds RPM on tag push or manual trigger
 ├── firmware/
 │   └── csi_recv_router/    # Patched ESP32 firmware (NVS WiFi + UART commands)
 ├── src/                    # Vite/React dashboard source
