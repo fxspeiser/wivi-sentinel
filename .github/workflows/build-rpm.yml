@@ -56,13 +56,12 @@ jobs:
           name: wivi-sentinel-${{ steps.version.outputs.version }}.noarch.rpm
           path: wivi-sentinel-*.noarch.rpm
 
-      - name: Upload to GitHub Release
+      - name: Create GitHub Release and upload RPM
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-upload-release-asset@v1
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Wi-Vi Sentinel v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: wivi-sentinel-*.noarch.rpm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: wivi-sentinel-*.noarch.rpm
-          asset_name: wivi-sentinel-${{ steps.version.outputs.version }}-1.noarch.rpm
-          asset_content_type: application/x-rpm
