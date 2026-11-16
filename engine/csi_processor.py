@@ -156,12 +156,21 @@ SEX_FEATURE_WEIGHTS = {
 class CSIFrame:
     """Single CSI measurement frame across all subcarriers."""
     def __init__(self, timestamp: float, amplitudes: np.ndarray, phases: np.ndarray,
-                 rssi: float = 0.0, raw_amplitude: float = 0.0):
+                 rssi: float = 0.0, raw_amplitude: float = 0.0,
+                 raw_amplitudes: Optional[np.ndarray] = None,
+                 device_ts: Optional[float] = None,
+                 noise_floor: Optional[float] = None):
         self.timestamp = timestamp
         self.amplitudes = amplitudes  # shape: (N_SUBCARRIERS,)
         self.phases = phases          # shape: (N_SUBCARRIERS,)
         self.rssi = rssi              # dBm from CSI_DATA header
         self.raw_amplitude = raw_amplitude  # pre-normalization max amplitude
+        # Optional extras consumed by engine/analysis.py (pipeline v2). Sources
+        # that cannot provide them leave them None and v2 falls back to the
+        # fields above.
+        self.raw_amplitudes = raw_amplitudes  # un-normalised, un-interpolated subcarriers
+        self.device_ts = device_ts            # capture-device clock, monotonic seconds
+        self.noise_floor = noise_floor        # dBm
 
 
 # ═════════════════════════════════════════════════════════════════════════════
