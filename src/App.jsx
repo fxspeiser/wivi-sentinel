@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } from 'react';
+import SignalLab from './SignalLab.jsx';
 
 const API = window.location.origin + "/api";
 
@@ -1068,6 +1069,159 @@ function CompactRow({ profile, onTag }) {
 
 // ─── Filter Button ───────────────────────────────────────────────────────────
 
+// ─── Admin controls ─────────────────────────────────────────────────────────
+
+function Toggle({ checked, onChange, disabled, accent }) {
+  const t = useContext(ThemeContext);
+  const fg = accent || t.green;
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => !disabled && onChange(!checked)}
+      style={{
+        width: 30, height: 16, flexShrink: 0, padding: 0, borderRadius: 8, position: "relative",
+        cursor: disabled ? "wait" : "pointer",
+        background: checked ? hexToRgba(fg, 0.25) : t.bgInput,
+        border: `1px solid ${checked ? hexToRgba(fg, 0.55) : t.border}`,
+        opacity: disabled ? 0.5 : 1, transition: "background 0.15s ease, border-color 0.15s ease",
+      }}
+    >
+      <span style={{
+        position: "absolute", top: 2, left: checked ? 15 : 2,
+        width: 10, height: 10, borderRadius: "50%",
+        background: checked ? fg : t.textMuted,
+        boxShadow: checked ? `0 0 6px ${fg}` : "none",
+        transition: "left 0.15s ease, background 0.15s ease",
+      }} />
+    </button>
+  );
+}
+
+function NumberField({ label, value, min, max, step, onCommit }) {
+  const t = useContext(ThemeContext);
+  const [draft, setDraft] = useState(String(value));
+  const [dirty, setDirty] = useState(false);
+
+  // Track upstream changes unless the operator is mid-edit.
+  useEffect(() => { if (!dirty) setDraft(String(value)); }, [value, dirty]);
+
+  const commit = () => {
+    setDirty(false);
+    const n = parseFloat(draft);
+    if (!Number.isFinite(n) || n < min || n > max) { setDraft(String(value)); return; }
+    if (n !== value) onCommit(n);
+  };
+
+  return (
+    <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 5 }}>
+      <span style={{ fontSize: 9, color: t.textSecondary, fontWeight: 600, letterSpacing: "0.05em" }}>
+        {label}
+        <span style={{ color: t.textDim, fontWeight: 500 }}> ({min}–{max})</span>
+      </span>
+      <input
+        type="number" min={min} max={max} step={step} value={draft}
+        onChange={e => { setDirty(true); setDraft(e.target.value); }}
+        onBlur={commit}
+        onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") { setDirty(false); setDraft(String(value)); e.currentTarget.blur(); } }}
+        style={{
+          width: 56, background: t.bgInput, border: `1px solid ${t.border}`, borderRadius: 3,
+          color: t.textPrimary, padding: "3px 5px", fontSize: 10,
+          fontFamily: "'JetBrains Mono', monospace", outline: "none", textAlign: "right",
+        }}
+      />
+    </label>
+  );
+}
+
+/**
+ * Administration surface: independent on/off switches for each analysis stage,
+ * plus the matching thresholds. Every change is persisted server-side and takes
+ * effect on the next analysis window.
+ */
+function AdminControls({ detectors, config, bounds, onApply, busyKey, error }) {
+  const t = useContext(ThemeContext);
+  const [open, setOpen] = useState(false);
+
+  const numeric = [
+    ["match_threshold",    "MATCH THRESHOLD", 0.01],
+    ["min_signal_quality", "MIN QUALITY",     0.01],
+    ["scan_interval",      "SCAN INTERVAL s", 0.1],
+    ["identity_min_confidence", "ID MIN CONFIDENCE", 0.01],
+    ["identity_min_margin",     "ID MIN MARGIN",     0.01],
+  ];
+
+  return (
+    <div>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{ fontSize: 9, color: t.textMid, letterSpacing: "0.15em", fontWeight: 700, marginBottom: 6, paddingBottom: 5, borderBottom: `1px solid ${t.border}`, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+      >
+        <span>ADMIN CONTROLS</span>
+        <span style={{ fontSize: 11, transform: open ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s" }}>&#9654;</span>
+      </div>
+
+      {open && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 8, color: t.textMuted, fontWeight: 700, letterSpacing: "0.12em", marginBottom: 5 }}>DETECTORS</div>
+            {detectors.map(d => {
+              const accent = d.sensitive ? "#ef4444" : d.unreliable ? "#fbbf24" : t.green;
+              return (
+                <div key={d.key} style={{ display: "flex", alignItems: "flex-start", gap: 7, padding: "5px 0", borderBottom: `1px solid ${t.borderDim}` }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: d.enabled ? t.textPrimary : t.textMuted, letterSpacing: "0.03em" }}>
+                      {d.label}
+                    </div>
+                    {(d.sensitive || d.unreliable) && (
+                      <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: "0.06em", marginTop: 2, color: d.sensitive ? "#ef4444" : "#fbbf24" }}>
+                        {d.sensitive
+                          ? "\u26A0 INFERS SENSITIVE DATA"
+                          : "\u26A0 LOW CONFIDENCE ON THIS HARDWARE"}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 8, color: t.textMuted, lineHeight: 1.45, marginTop: 1 }}>{d.detail}</div>
+                  </div>
+                  <Toggle
+                    checked={d.enabled}
+                    disabled={busyKey === d.key}
+                    accent={accent}
+                    onChange={next => onApply({ [d.key]: next }, d.key)}
+                  />
+                </div>
+              );
+            })}
+          </div>
+
+          <div>
+            <div style={{ fontSize: 8, color: t.textMuted, fontWeight: 700, letterSpacing: "0.12em", marginBottom: 5 }}>THRESHOLDS</div>
+            {numeric.map(([key, label, step]) => {
+              const [min, max] = bounds?.[key] || [0, 1];
+              return (
+                <NumberField
+                  key={key} label={label} value={config?.[key] ?? 0}
+                  min={min} max={max} step={step}
+                  onCommit={v => onApply({ [key]: v }, key)}
+                />
+              );
+            })}
+          </div>
+
+          {error && (
+            <div style={{ fontSize: 9, fontWeight: 600, color: "#ef4444", lineHeight: 1.4 }}>{error}</div>
+          )}
+          <div style={{ fontSize: 8, color: t.textMuted, lineHeight: 1.45 }}>
+            Settings persist to <code>data/config.json</code> and apply from the next
+            analysis window. Heartbeat and gait are independent — neither enables the other.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 function FilterBtn({ label, active, color, count, onClick }) {
   const t = useContext(ThemeContext);
   const fg = color || t.green;
@@ -1109,6 +1263,13 @@ export default function App() {
   const [wifiSaving, setWifiSaving] = useState(false);
   const [wifiMsg, setWifiMsg]       = useState(null);
   const [wifiStatus, setWifiStatus] = useState(null);
+  const [adminBounds, setAdminBounds] = useState(null);
+  const [adminBusy, setAdminBusy]     = useState(null);
+  const [adminError, setAdminError]   = useState(null);
+  const [labOpen, setLabOpen] = useState(() => {
+    try { return localStorage.getItem('wivi-signal-lab') !== 'closed'; } catch { return true; }
+  });
+  useEffect(() => { try { localStorage.setItem('wivi-signal-lab', labOpen ? 'open' : 'closed'); } catch {} }, [labOpen]);
 
   const t = darkMode ? THEMES.dark : THEMES.light;
 
@@ -1139,6 +1300,40 @@ export default function App() {
   const handleTag     = async (id, name) => { try { await fetch(`${API}/profiles/tag`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile_id: id, nickname: name }) }); fetchData(); } catch {} };
   const handleDelete  = async (id) => { try { await fetch(`${API}/profiles/${id}`, { method: "DELETE" }); fetchData(); } catch {} };
   const handleSuggest = async (profileId, deviceName) => { try { await fetch(`${API}/devices/suggest`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile_id: profileId, device_name: deviceName }) }); fetchData(); } catch {} };
+
+  // Validation bounds are static — fetch once rather than on every poll.
+  useEffect(() => {
+    fetch(`${API}/admin/config`)
+      .then(r => r.json())
+      .then(d => setAdminBounds(d.bounds || null))
+      .catch(() => {});
+  }, []);
+
+  const detectors = status?.detectors || [];
+  const detectorOn = useCallback(
+    key => { const d = detectors.find(x => x.key === key); return d ? d.enabled : true; },
+    [detectors],
+  );
+
+  const handleConfigApply = async (updates, key) => {
+    setAdminBusy(key);
+    setAdminError(null);
+    try {
+      const resp = await fetch(`${API}/admin/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updates),
+      });
+      const data = await resp.json();
+      if (!resp.ok) setAdminError(data.error || "Update rejected");
+      // Re-read authoritative state either way, so a rejected change never
+      // leaves the switch showing something the server did not accept.
+      await fetchData();
+    } catch {
+      setAdminError("Network error");
+    }
+    setAdminBusy(null);
+  };
 
   const handleWifiSave = async () => {
     if (!wifiSsid.trim()) return;
@@ -1225,6 +1420,13 @@ export default function App() {
     });
   }, [filtered]);
 
+  // Most recent original-pipeline readings, shown beside the v2 ones in the Signal Lab.
+  const legacyRates = useMemo(() => {
+    const latest = (type) => [...history].reverse().find(h => h.type === type)?.metadata || {};
+    const hb = latest("heartbeat"), gait = latest("gait");
+    return { bpm: hb.bpm, respiratory_rate: hb.respiratory_rate, cadence_spm: gait.cadence_spm, harmonic_ratio: gait.harmonic_ratio };
+  }, [history]);
+
   const SectionLabel = ({ children }) => (
     <div style={{ fontSize: 9, color: t.textMid, letterSpacing: "0.15em", fontWeight: 700, marginBottom: 6, paddingBottom: 5, borderBottom: `1px solid ${t.border}` }}>{children}</div>
   );
@@ -1272,11 +1474,20 @@ export default function App() {
               ))}
             </div>
 
+            <AdminControls
+              detectors={detectors}
+              config={status?.config}
+              bounds={adminBounds}
+              onApply={handleConfigApply}
+              busyKey={adminBusy}
+              error={adminError}
+            />
+
             <div>
               <SectionLabel>SIGNAL TYPE</SectionLabel>
               <FilterBtn label="ALL"       active={filter === "all"}       count={counts.all}       onClick={() => setFilter("all")} />
-              <FilterBtn label="HEARTBEAT" active={filter === "heartbeat"} count={counts.heartbeat} color="#ff3e6c" onClick={() => setFilter("heartbeat")} />
-              <FilterBtn label="GAIT"      active={filter === "gait"}      count={counts.gait}      color="#00b4d8" onClick={() => setFilter("gait")} />
+              <FilterBtn label="HEARTBEAT" active={filter === "heartbeat"} count={detectorOn("heartbeat_enabled") ? counts.heartbeat : "OFF"} color="#ff3e6c" onClick={() => setFilter("heartbeat")} />
+              <FilterBtn label="GAIT"      active={filter === "gait"}      count={detectorOn("gait_enabled") ? counts.gait : "OFF"}           color="#00b4d8" onClick={() => setFilter("gait")} />
               <FilterBtn label="NEW"       active={filter === "new"}       count={counts.new}       color="#fbbf24" onClick={() => setFilter("new")} />
             </div>
 
@@ -1402,19 +1613,39 @@ export default function App() {
             <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 10, marginBottom: 18 }}>
               {[
                 { label: "TOTAL",       value: profiles.length,                                                      color: t.textPrimary },
-                { label: "HEARTBEAT",   value: counts.heartbeat,                                                     color: "#ff3e6c" },
-                { label: "GAIT",        value: counts.gait,                                                          color: "#00b4d8" },
-                { label: "HUMAN",       value: counts.human,                                                         color: t.green },
-                { label: "ANIMAL",      value: (counts.dog || 0) + (counts.cat || 0) + (counts.large_animal || 0),  color: "#f59e0b" },
-                { label: "APPROACHING", value: counts.approaching,                                                   color: "#ef4444" },
+                { label: "HEARTBEAT",   value: counts.heartbeat,   color: "#ff3e6c", off: !detectorOn("heartbeat_enabled") },
+                { label: "GAIT",        value: counts.gait,        color: "#00b4d8", off: !detectorOn("gait_enabled") },
+                { label: "HUMAN",       value: counts.human,       color: t.green,   off: !detectorOn("species_classification_enabled") },
+                { label: "ANIMAL",      value: (counts.dog || 0) + (counts.cat || 0) + (counts.large_animal || 0), color: "#f59e0b", off: !detectorOn("species_classification_enabled") },
+                { label: "APPROACHING", value: counts.approaching, color: "#ef4444", off: !detectorOn("direction_detection_enabled") },
                 { label: "DEVICES",     value: Object.keys(devices).length,                                          color: "#a78bfa" },
               ].map((s, i) => (
                 <div key={i} style={{ background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 6, padding: "10px 12px" }}>
                   <div style={{ fontSize: 9, color: t.textSecondary, letterSpacing: "0.1em", marginBottom: 3, fontWeight: 600 }}>{s.label}</div>
-                  <div style={{ fontSize: 26, fontWeight: 800, color: s.color, lineHeight: 1 }}>{s.value}</div>
+                  <div
+                    title={s.off ? "Detector disabled in admin controls" : undefined}
+                    style={{ fontSize: s.off ? 15 : 26, fontWeight: 800, color: s.off ? t.textDim : s.color, lineHeight: s.off ? 1.7 : 1 }}
+                  >{s.off ? "OFF" : s.value}</div>
                 </div>
               ))}
             </div>
+
+            {/* Signal Lab: pipeline-v2 diagnostics, roster identification, enrolment */}
+            <button
+              onClick={() => setLabOpen(o => !o)}
+              aria-expanded={labOpen}
+              style={{
+                display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left",
+                padding: "7px 0", marginBottom: 10, background: "transparent", border: "none",
+                borderBottom: `1px solid ${t.border}`, color: t.textMid, cursor: "pointer",
+                fontSize: 10, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: "0.15em",
+              }}
+            >
+              <span style={{ fontSize: 11, transform: labOpen ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s" }}>&#9654;</span>
+              SIGNAL LAB
+              <span style={{ color: t.textMuted, fontWeight: 500, letterSpacing: "0.04em" }}>live signal · rates · roster identification</span>
+            </button>
+            {labOpen && <SignalLab api={API} t={t} dark={darkMode} legacy={legacyRates} config={status?.config} />}
 
             {/* View toggle */}
             <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>

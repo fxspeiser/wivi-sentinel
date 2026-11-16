@@ -64,6 +64,10 @@ class ESP32CSISource:
         self._last_packet_time = None
         self._start_time = time.time()
 
+        # Device-clock unwrapping (rx_ctrl->timestamp is a wrapping uint32 of µs)
+        self._dev_ts_last_raw = None
+        self._dev_ts_offset = 0.0
+
         # Shared serial connection (managed by reader thread)
         self._ser = None
         self._ser_lock = threading.Lock()  # protects writes to _ser
@@ -202,6 +206,7 @@ class ESP32CSISource:
                     rssi = float(fields[3])  # RSSI is 4th field (index 3)
                 except (ValueError, IndexError):
                     pass
+            device_ts, noise_floor = self._parse_device_fields(fields)
 
             data_str = line[bracket_start + 1:bracket_end]
             values = [int(x) for x in data_str.split(',')]
@@ -227,6 +232,10 @@ class ESP32CSISource:
             amplitudes = np.sqrt(real**2 + imag**2)
             phases = np.arctan2(imag, real)
 
+            # Keep the real subcarriers at their measured scale for pipeline v2,
+            # before the legacy path interpolates and per-frame normalises them.
+            raw_amplitudes = amplitudes.copy()
+
             # Resample to pipeline's N_SUBCARRIERS (56)
             n_active = len(amplitudes)
             if n_active != N_SUBCARRIERS:
@@ -248,11 +257,46 @@ class ESP32CSISource:
                 phases=phases,
                 rssi=rssi,
                 raw_amplitude=raw_amplitude,
+                raw_amplitudes=raw_amplitudes,
+                device_ts=device_ts,
+                noise_floor=noise_floor,
             )
 
         except (ValueError, IndexError) as e:
             logger.debug(f"CSI_DATA parse error: {e}")
             return None
+
+    def _parse_device_fields(self, fields):
+        """Pull the ESP32 capture timestamp and noise floor out of the CSV prefix.
+
+        Two firmware layouts exist (see firmware/csi_recv_router/main/app_main.c):
+          gain-compensated: type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,
+                            channel,local_timestamp,...          (timestamp at 9)
+          classic:          ...,noise_floor(14),...,local_timestamp(18),...
+        Returns (device_ts_seconds or None, noise_floor or None). The device
+        clock is free of the USB/UART batching jitter that host arrival time has.
+        """
+        if len(fields) >= 24:
+            ts_idx, nf_idx = 18, 14
+        elif len(fields) >= 14:
+            ts_idx, nf_idx = 9, 5
+        else:
+            return None, None
+        try:
+            raw_us = int(fields[ts_idx])
+            noise_floor = float(fields[nf_idx])
+        except (ValueError, IndexError):
+            return None, None
+        if raw_us < 0:
+            return None, noise_floor
+        # Unwrap: the counter wraps every ~71 min and restarts on reboot. Either
+        # way, keep the reported clock strictly increasing.
+        last = self._dev_ts_last_raw
+        if last is not None and raw_us < last:
+            self._dev_ts_offset += (last + 10_000) / 1e6 if last - raw_us < 2 ** 31 \
+                else 2 ** 32 / 1e6
+        self._dev_ts_last_raw = raw_us
+        return self._dev_ts_offset + raw_us / 1e6, noise_floor
 
     # ── Serial command interface ─────────────────────────────────────────────
 

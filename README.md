@@ -475,6 +475,114 @@ Base URL: `http://<pi-ip>:5555`
 | POST | `/api/esp32/wifi` | `{ssid, password}` — update ESP32 WiFi (reboots) |
 | GET | `/api/esp32/wifi` | Current ESP32 WiFi connection status |
 | GET | `/api/stream` | Server-sent events (real-time detection stream) |
+| GET | `/api/admin/config` | Current settings, detector switches, validation bounds |
+| POST | `/api/admin/config` | Partial settings update (validated, persisted) |
+| GET | `/api/analysis` | Signal Lab snapshot: signal health, motion state, v2 rates, PSD, spectrogram, heatmap, roster identity |
+| POST / DELETE | `/api/analysis/baseline` | Calibrate the motion gate to the empty room / clear the calibration |
+| GET | `/api/enroll` | Enrolled roster and the state of any capture in progress |
+| POST | `/api/enroll/start` | `{name, session, path, duration_s, sex?, species?}` — record a labelled walk |
+| POST | `/api/enroll/stop` | Finish the capture early; `{discard: true}` throws it away |
+| DELETE | `/api/enroll/:name` | Remove a person's enrolment, including their raw recordings |
+| POST | `/api/model/train` | Refit the roster classifier and re-run validation |
+| GET | `/api/model/report` | Validation protocol, accuracy, confusion matrix, embedding |
+
+---
+
+## Admin Controls
+
+The dashboard sidebar has an **ADMIN CONTROLS** panel that switches each analysis
+stage on and off independently. Settings persist to `data/config.json` and take
+effect on the next analysis window — no restart needed.
+
+| Control | Default | Effect when off |
+|---|---|---|
+| Heartbeat sensing | on | No cardiac/respiratory extraction; no heartbeat detections or profiles |
+| Gait analysis | on | No cadence/stride extraction; no gait detections or profiles |
+| Direction / velocity | on | No Doppler direction or speed reported |
+| Species classification | on | No human/dog/cat label reported |
+| Sex estimation | on | No sex inference reported |
+| Device name correlation | on | Device scanning continues, but names are never linked to a body signature |
+| Automatic profile enrolment | on | Known profiles still match; unmatched signatures are reported live but not stored |
+
+**Heartbeat and gait are fully independent** — neither enables the other, and
+either can run alone. When a detector is off the dashboard shows `OFF` rather
+than `0`, so a disabled detector is never mistaken for a zero measurement.
+
+Two controls are flagged in the UI:
+
+- **⚠ INFERS SENSITIVE DATA** — sex estimation and device-name correlation infer
+  personal attributes about people who have not consented to being sensed.
+- **⚠ LOW CONFIDENCE ON THIS HARDWARE** — direction/velocity and species
+  classification are not well supported by a single-antenna ESP32 (see
+  *Known Accuracy Limitations*).
+
+You can also set these from the command line:
+
+```bash
+curl -X POST http://<pi-ip>:5555/api/admin/config \
+  -H 'Content-Type: application/json' \
+  -d '{"heartbeat_enabled": false, "gait_enabled": true}'
+```
+
+Invalid keys, wrong types and out-of-range numbers are rejected with `400` and
+an explanatory message; the stored config is left untouched.
+
+---
+
+## Signal Lab (analysis pipeline v2)
+
+The **Signal Lab** panel at the top of the dashboard shows a second analysis
+pipeline that runs beside the original one. Nothing in the original pipeline is
+removed or changed: profile cards, radar, species, sex, direction and device
+correlation all work as before.
+
+**What it shows**
+
+| Panel | What it tells you |
+|---|---|
+| Signal health | Measured frame rate (from the ESP32's own clock), jitter, frame loss, spikes removed, motion state |
+| Motion spectrogram | How fast the channel is changing over the last 30 s. Amplitude only: it shows speed, not direction, and anything above half the frame rate aliases |
+| Subcarrier heatmap | Each subcarrier's deviation from its resting level over time |
+| Rate spectrum | The 0–5 Hz spectrum that breathing, pulse and step rates are read from, with the original 256-sample estimate overlaid |
+| Rates: original vs v2 | Both pipelines' numbers side by side, with v2's resolution, SNR and validity |
+| Roster identification | Who is walking, among enrolled people, with confidence over time |
+| Gait embedding / Validation | 2-D view of enrolled walks, and the held-out confusion matrix |
+
+**Why a second pipeline.** The original estimators use a 256-sample spectrum at
+an assumed 100 Hz, so every rate is a multiple of 23.4 per minute, and the gait
+harmonic is measured after a filter that removes it. Pipeline v2 measures the
+real frame rate, uses windows long enough to resolve each rate (30 s for
+respiration, 15 s for pulse, 10 s for cadence), reads harmonics from the
+unfiltered spectrum, and gates each estimate on motion state. A rate that fails
+its gate is shown as gated, not as a number.
+
+By default v2 runs in **shadow mode**: its values are displayed and attached to
+each detection as `analysis_v2`, but species and sex still use the original
+inputs. Turn on **Admin controls → Feed v2 rates to classifiers** to switch them
+over once you have compared the two on your own hardware.
+
+**Enrolling people and identifying them**
+
+1. With the room empty, press **Calibrate empty room**.
+2. In **Enrolment**, enter a name, a session label (defaults to today's date)
+   and a path label, then press **Record walk** while the person walks.
+3. Repeat: several walks per person, more than one path, and at least two
+   sessions on different days.
+4. Press **Train roster model**. The Validation panel reports held-out accuracy.
+
+Sex and species entered at enrolment are *looked up* once a person is
+identified; they are shown separately from the signal-derived estimates.
+
+Validation holds out whole sessions when it can, because CSI encodes the room
+and the path as much as the person. With only one session enrolled the panel
+says so and warns that the figure is optimistic. A walker who does not resemble
+anyone enrolled is reported as **Unknown**.
+
+Enrolment data lives in `data/enrollment.json` and `data/recordings/` (raw
+frames of each walk, kept so features can be recomputed later). Both are
+gitignored. Set `WIVI_DATA_DIR` to keep all persisted state somewhere else.
+
+**Tests:** `for t in tests/test_*.py; do python3 "$t"; done` (no pytest needed).
 
 ---
 
@@ -490,6 +598,10 @@ wivi-sentinel/
 ├── docker-compose.yml      # Docker: sentinel container with ESP32 passthrough
 ├── engine/
 │   ├── csi_processor.py    # Signal processing, classifiers, ProfileStore, coalescing
+│   ├── config.py           # Persisted, validated runtime settings
+│   ├── dsp.py              # v2 DSP primitives (resampling, Hampel, PCA, rate estimation)
+│   ├── analysis.py         # v2 analysis engine: buffer, gating, Signal Lab payloads, enrolment
+│   ├── identifier.py       # Roster classifier (shrinkage LDA), validation, enrolment store
 │   ├── esp32_source.py     # ESP32 CSI source (USB serial + WiFi config commands)
 │   ├── nexmon_source.py    # Nexmon CSI source (UDP, legacy)
 │   ├── device_scanner.py   # mDNS + probe request device discovery
@@ -505,6 +617,7 @@ wivi-sentinel/
 │   └── csi_recv_router/    # Patched ESP32 firmware (NVS WiFi + UART commands)
 ├── src/                    # Vite/React dashboard source
 │   ├── App.jsx             # Dashboard UI (cards, compact, radar)
+│   ├── SignalLab.jsx       # Signal Lab panel (spectrogram, heatmap, PSD, identity, enrolment)
 │   ├── main.jsx
 │   └── index.css
 ├── dist/                   # Pre-built dashboard (committed — no build step needed on Pi)
@@ -512,6 +625,7 @@ wivi-sentinel/
 ├── vite.config.js
 ├── package.json
 ├── requirements.txt        # Python deps
+├── tests/                  # python3 tests/test_*.py (no pytest needed)
 ├── .env.example            # Config template (copy to .env)
 └── data/
     └── profiles.json       # Biometric profiles (gitignored — each install tracks its own)

@@ -11,6 +11,7 @@ build/
 # Data / profiles (may contain biometric signatures)
 data/profiles.json
 data/*.json
+data/recordings/
 
 # Environment / secrets
 .env
